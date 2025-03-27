@@ -63,13 +63,15 @@ def check_pos(x, y):
 class ImprovedPotentialField:
     """改进的势能场计算类"""
     def __init__(self, 
-                 attractive_gain=1.0,      # 吸引势能增益
+                 attractive_gain=2.0,      # 吸引势能增益
                  repulsive_gain=1.0,       # 排斥势能增益
-                 attractive_decay=1.0,     # 吸引势场衰减率
+                 attractive_decay=2.0,     # 吸引势场衰减率
                  goal_threshold=0.3,       # 目标阈值
                  obstacle_threshold=1.5,   # 障碍物影响阈值
                  max_potential=10.0,       # 势能上限
-                 min_safe_dist=0.4):      # 最小安全距离
+                 min_safe_dist=0.4,        # 最小安全距离
+                 approach_factor=1.2,      # 靠近目标的势能因子
+                 retreat_factor=1.5):      # 远离目标的势能因子
         
         self.attractive_gain = attractive_gain
         self.repulsive_gain = repulsive_gain
@@ -78,11 +80,14 @@ class ImprovedPotentialField:
         self.obstacle_threshold = obstacle_threshold
         self.max_potential = max_potential
         self.min_safe_dist = min_safe_dist
+        self.approach_factor = approach_factor  # 靠近目标时增强势能差异
+        self.retreat_factor = retreat_factor    # 远离目标时增强势能差异
     
     def exponential_attractive_potential(self, distance):
-        """使用指数形式的吸引势能函数，可以提供更平滑的梯度，且全局有界"""
+        """使用指数形式的吸引势能函数，提供平滑且非线性的梯度"""
         if distance < self.goal_threshold:
             return 0.0
+        # 使用更陡峭的指数曲线增强吸引力
         return self.attractive_gain * (1 - np.exp(-self.attractive_decay * distance))
     
     def repulsive_potential(self, min_obstacle_distance):
@@ -110,11 +115,34 @@ class ImprovedPotentialField:
         # 计算排斥势能
         repulsive = self.repulsive_potential(min_obstacle_dist)
         
-        # 计算总势能 (吸引势能 + 排斥势能) - 注意这里是相加，因为排斥势能本身就是正值
+        # 计算总势能 (吸引势能 + 排斥势能)
         total_potential = attractive + repulsive
         
         # 限制势能范围
         return np.clip(total_potential, 0.0, self.max_potential)
+    
+    def calculate_potential_difference(self, current_state, next_state, goal_pos, current_min_obstacle, next_min_obstacle, gamma=0.99):
+        """计算两个状态之间的势能差异，并根据靠近或远离目标增强差异"""
+        # 计算当前和下一个状态的势能
+        current_potential = self.calculate_potential(current_state, goal_pos, current_min_obstacle)
+        next_potential = self.calculate_potential(next_state, goal_pos, next_min_obstacle)
+        
+        # 计算当前和下一状态到目标的距离
+        current_distance = np.linalg.norm([current_state[0] - goal_pos[0], current_state[1] - goal_pos[1]])
+        next_distance = np.linalg.norm([next_state[0] - goal_pos[0], next_state[1] - goal_pos[1]])
+        
+        # 势能差异的基础计算
+        potential_diff = current_potential - gamma * next_potential
+        
+        # 根据距离变化调整势能差异
+        if next_distance < current_distance:  # 靠近目标
+            # 增强靠近目标的正向奖励
+            potential_diff *= self.approach_factor
+        else:  # 远离目标
+            # 增强远离目标的负向惩罚
+            potential_diff *= self.retreat_factor
+            
+        return potential_diff
 
 
 class GazeboEnv:
@@ -140,11 +168,15 @@ class GazeboEnv:
         # 势能函数参数
         self.gamma = 0.99  # 势能折扣因子
         # 奖励权重参数
-        self.speed_weight = 0.5       # 速度奖励权重
-        self.turn_weight = 0.5        # 转向惩罚权重  
-        self.obstacle_weight = 0.5    # 障碍物惩罚权重
-        self.potential_weight = 1.0   # 势能奖励权重
-        self.smoothness_weight = 0.1  # 平滑奖励权重
+        self.speed_weight = 0.5        # 速度奖励权重
+        self.turn_weight = 0.8         # 转向惩罚权重  
+        self.obstacle_weight = 0.5     # 障碍物惩罚权重
+        self.potential_weight = 2.5    # 增强势能奖励权重
+        self.smoothness_weight = 0.2   # 平滑奖励权重
+        
+        # 设置转向惩罚阈值和系数
+        self.excessive_turn_threshold = 0.5  # 过度转向的阈值
+        self.excessive_turn_penalty = 1.0    # 过度转向的惩罚系数
         
         # 目标和碰撞阈值
         self.goal_threshold = GOAL_REACHED_DIST
@@ -205,12 +237,15 @@ class GazeboEnv:
             self.last_odom.pose.pose.position.y = 0.0
             self.last_odom.pose.pose.orientation.w = 1.0
         
-        # 初始化势能场计算器
+        # 初始化势能场计算器，调整参数
         self.potential_field = ImprovedPotentialField(
-            attractive_gain=1.0, 
-            repulsive_gain=1.0,
+            attractive_gain=2.5,        # 增强吸引势能增益 
+            repulsive_gain=1.2,         # 适当增加排斥势能增益
+            attractive_decay=2.0,       # 增加吸引势场衰减率
             obstacle_threshold=1.5,
-            min_safe_dist=0.4
+            min_safe_dist=0.4,
+            approach_factor=1.5,        # 靠近目标时的势能因子
+            retreat_factor=2.0          # 远离目标时的势能因子（惩罚更强）
         )
         
         print("Environment initialization complete!")
@@ -236,12 +271,11 @@ class GazeboEnv:
     def odom_callback(self, od_data):
         self.last_odom = od_data
         self.odom_received = True
-
         
-    # 改进的奖励函数
-    def improved_reward_with_potential(self, target, collision,action, min_laser, current_state, next_state):
+    # 基于势能场的奖励函数 - 完全基于势能差异来奖励/惩罚靠近/远离目标行为
+    def potential_based_reward(self, target, collision, action, current_state, next_state, current_min_laser, next_min_laser):
         """
-        改进的基于势能场的奖励函数 - 移除重复的前进奖励
+        完全基于势能场的奖励函数 - 通过势能差异表达靠近/远离目标的奖励/惩罚
         """
         # 基础奖励 - 目标达成和碰撞处理
         if target:
@@ -249,35 +283,44 @@ class GazeboEnv:
         elif collision:
             return -100.0
         
-        # 解析当前和下一状态
-        current_x, current_y = current_state
-        next_x, next_y = next_state
-        
-        # 计算势能
-        current_potential = self.potential_field.calculate_potential(
-            (current_x, current_y), 
+        # 使用势能场类计算势能差异（包含了靠近目标的奖励和远离目标的惩罚）
+        potential_diff = self.potential_field.calculate_potential_difference(
+            current_state, 
+            next_state, 
             (self.goal_x, self.goal_y), 
-            min_laser
+            current_min_laser,
+            next_min_laser,
+            self.gamma
         )
         
-        next_potential = self.potential_field.calculate_potential(
-            (next_x, next_y), 
-            (self.goal_x, self.goal_y), 
-            min_laser
-        )
+        # 计算过度转弯惩罚
+        turn_penalty = 0
+        angular_velocity = abs(action[1])
+        if angular_velocity > self.excessive_turn_threshold:
+            # 使用二次函数使惩罚随转向增大而更快增长
+            turn_penalty = -self.turn_weight * (angular_velocity - self.excessive_turn_threshold) ** 2
         
-        # 计算势能差异 (当前势能 - 折扣后的下一状态势能)
-        # 势能下降(朝向目标移动)会产生正奖励
-        potential_diff = current_potential - self.gamma * next_potential
+        # 平滑性惩罚 - 惩罚动作与上一动作之间的突变
+        action_change = np.abs(np.array(action) - np.array(self.last_action))
+        smoothness_penalty = -self.smoothness_weight * np.sum(action_change)
         
         # 各奖励组件
         rewards = {
-            # 1. 势能差奖励 (主要引导信号) - 使用势能差异作为主要奖励
-            'potential_reward': potential_diff * 2.0,  # 增强信号强度
+            # 1. 势能差奖励 (主要引导信号，已经包含了靠近/远离目标的奖励/惩罚)
+            'potential_reward': potential_diff * self.potential_weight,
             
-            # 2. 存活惩罚 (鼓励快速完成任务) - 移除了前进奖励，只保留存活惩罚
+            # 2. 过度转弯惩罚
+            'turn_penalty': turn_penalty,
+            
+            # 3. 行为平滑性惩罚
+            'smoothness_penalty': smoothness_penalty,
+            
+            # 4. 存活惩罚 (鼓励快速完成任务)
             'living_penalty': -0.05
         }
+        
+        # 更新上一次的动作
+        self.last_action = action.copy()
         
         # 组合所有奖励分量
         total_reward = sum(rewards.values())
@@ -285,12 +328,13 @@ class GazeboEnv:
         # 限制奖励范围
         return np.clip(total_reward, -10.0, 10.0)
 
-    # Perform an action and read a new state - 使用改进的奖励函数
+    # Perform an action and read a new state - 使用基于势能场的奖励函数
     def step(self, action):
         target = False
 
-        # 保存当前位置作为前一个状态
+        # 保存当前位置和激光数据作为前一个状态
         current_state = (self.odom_x, self.odom_y)
+        current_min_laser = min(self.velodyne_data)
         self.prev_odom_x = self.odom_x
         self.prev_odom_y = self.odom_y
 
@@ -318,7 +362,7 @@ class GazeboEnv:
             print("/gazebo/pause_physics service call failed")
 
         # read velodyne laser state
-        done, collision, min_laser = self.observe_collision(self.velodyne_data)
+        done, collision, next_min_laser = self.observe_collision(self.velodyne_data)
         v_state = []
         v_state[:] = self.velodyne_data[:]
         laser_state = [v_state]
@@ -377,8 +421,12 @@ class GazeboEnv:
         robot_state = [distance, theta, action[0], action[1]]
         state = np.append(laser_state, robot_state)
         
-        # 使用改进的奖励函数计算奖励
-        reward = self.improved_reward_with_potential(target, collision, action, min_laser, current_state, next_state)
+        # 使用基于势能场的奖励函数计算奖励
+        reward = self.potential_based_reward(
+            target, collision, action, 
+            current_state, next_state,
+            current_min_laser, next_min_laser
+        )
         
         return state, reward, done, target
 
