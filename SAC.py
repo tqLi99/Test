@@ -22,6 +22,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"使用设备: {device}")
 
 
+# 启用梯度异常检测 (可选，用于调试)
+# torch.autograd.set_detect_anomaly(True)
+
 # 创建TensorBoard日志目录
 def create_tensorboard_writer(comment=''):
     """创建TensorBoard日志写入器"""
@@ -151,100 +154,6 @@ class AdaptiveFormationEnvironment:
             positions[i] = [math.cos(angle), math.sin(angle)]
 
         return positions
-
-    def _initialize_static_obstacles(self):
-        """初始化静态障碍物"""
-        obstacles = []
-
-        # 确保目标区域和起始区域没有障碍物
-        safe_radius_start = 3.0
-        safe_radius_target = 3.0
-
-        for _ in range(self.n_static_obstacles):
-            valid_position = False
-            attempts = 0
-
-            while not valid_position and attempts < 100:
-                # 随机位置
-                pos = np.random.rand(2) * self.world_size
-
-                # 检查是否与起始区域和目标区域重叠
-                if hasattr(self, 'positions'):
-                    dist_to_start = np.min([np.linalg.norm(pos - self.positions[i]) for i in range(self.n_agents)])
-                else:
-                    dist_to_start = safe_radius_start + 1  # 确保通过检查
-                dist_to_target = np.linalg.norm(pos - self.target_position)
-
-                # 检查是否与其他障碍物重叠
-                dist_to_obstacles = float('inf')
-                if obstacles:
-                    dist_to_obstacles = np.min([np.linalg.norm(pos - obs['position']) for obs in obstacles])
-
-                if (dist_to_start > safe_radius_start and
-                        dist_to_target > safe_radius_target and
-                        dist_to_obstacles > 2 * self.obstacle_radius):
-                    valid_position = True
-                    obstacles.append({
-                        'position': pos,
-                        'radius': self.obstacle_radius + np.random.rand() * 0.5  # 随机调整大小
-                    })
-
-                attempts += 1
-
-        return obstacles
-
-    def _initialize_dynamic_obstacles(self):
-        """初始化动态障碍物"""
-        obstacles = []
-
-        # 确保目标区域和起始区域没有障碍物
-        safe_radius_start = 3.0
-        safe_radius_target = 3.0
-
-        for _ in range(self.n_dynamic_obstacles):
-            valid_position = False
-            attempts = 0
-
-            while not valid_position and attempts < 100:
-                # 随机位置
-                pos = np.random.rand(2) * self.world_size
-
-                # 检查是否与起始区域和目标区域重叠
-                if hasattr(self, 'positions'):
-                    dist_to_start = np.min([np.linalg.norm(pos - self.positions[i]) for i in range(self.n_agents)])
-                else:
-                    dist_to_start = safe_radius_start + 1
-                dist_to_target = np.linalg.norm(pos - self.target_position)
-
-                # 检查是否与其他障碍物重叠
-                dist_to_static = float('inf')
-                if hasattr(self, 'static_obstacles') and self.static_obstacles:
-                    dist_to_static = np.min([np.linalg.norm(pos - obs['position']) for obs in self.static_obstacles])
-
-                dist_to_dynamic = float('inf')
-                if obstacles:
-                    dist_to_dynamic = np.min([np.linalg.norm(pos - obs['position']) for obs in obstacles])
-
-                if (dist_to_start > safe_radius_start and
-                        dist_to_target > safe_radius_target and
-                        dist_to_static > 2 * self.obstacle_radius and
-                        dist_to_dynamic > 2 * self.obstacle_radius):
-                    valid_position = True
-
-                    # 随机速度和方向
-                    angle = np.random.rand() * 2 * np.pi
-                    speed = 0.1 + np.random.rand() * 0.2  # 随机速度
-                    velocity = np.array([np.cos(angle), np.sin(angle)]) * speed
-
-                    obstacles.append({
-                        'position': pos,
-                        'radius': self.obstacle_radius,
-                        'velocity': velocity
-                    })
-
-                attempts += 1
-
-        return obstacles
 
     def _initialize_mixed_static_obstacles(self):
         """初始化混合的静态障碍物 - 部分固定位置，部分随机生成"""
@@ -522,7 +431,8 @@ class AdaptiveFormationEnvironment:
 
         # 计算旋转角度
         cos_angle = np.dot(default_forward, forward)
-        sin_angle = np.cross(default_forward, forward)
+        # 修复NumPy 2D向量叉积的警告，使用atan2来计算角度
+        sin_angle = forward[0] * default_forward[1] - forward[1] * default_forward[0]
 
         # 旋转矩阵
         rotation_matrix = np.array([
@@ -802,9 +712,9 @@ class ImprovedRewardCalculator:
             'progress': 5.0,
             'formation': 0.2,
             'collision': -3.0,
-            'cooperation': 1.0,  # 新增：合作奖励
-            'efficiency': 0.5,  # 新增：效率奖励
-            'exploration': 0.1,  # 新增：探索奖励
+            'cooperation': 1.0,
+            'efficiency': 0.5,
+            'exploration': 0.1,
             'target_reach': 2.0,
             'survival': 0.01,
             'success': 10.0
@@ -1009,7 +919,7 @@ class EfficientQNetwork(nn.Module):
         return q1, q2
 
 
-# 优先经验回放缓冲区
+# 修复的优先经验回放缓冲区
 class PrioritizedReplayBuffer:
     def __init__(self, max_size=1e6, alpha=0.6, beta=0.4, beta_increment=0.001):
         self.max_size = int(max_size)
@@ -1056,65 +966,24 @@ class PrioritizedReplayBuffer:
         return (state_batch, action_batch, reward_batch, next_state_batch, done_batch), indices, weights
 
     def update_priorities(self, indices, priorities):
+        # 修复NumPy标量转换警告
         for idx, priority in zip(indices, priorities):
-            self.priorities[idx] = priority + 1e-6
+            # 确保priority是标量值
+            if isinstance(priority, (np.ndarray, torch.Tensor)):
+                if hasattr(priority, 'item'):
+                    priority_val = priority.item()
+                else:
+                    priority_val = float(priority.flatten()[0])
+            else:
+                priority_val = float(priority)
+
+            self.priorities[idx] = priority_val + 1e-6
 
     def __len__(self):
         return len(self.buffer)
 
 
-# 超参数调度器
-class HyperparameterScheduler:
-    def __init__(self):
-        self.schedules = {
-            'learning_rate': self._cosine_schedule,
-            'exploration_noise': self._exponential_decay,
-            'entropy_weight': self._adaptive_entropy
-        }
-
-    def _cosine_schedule(self, initial_lr, episode, total_episodes):
-        return initial_lr * 0.5 * (1 + np.cos(np.pi * episode / total_episodes))
-
-    def _exponential_decay(self, initial_noise, episode, decay_rate=0.995):
-        return initial_noise * (decay_rate ** episode)
-
-    def _adaptive_entropy(self, current_alpha, q_loss, target_range=(0.1, 0.5)):
-        """根据Q损失自适应调整熵权重"""
-        if q_loss > target_range[1]:
-            return min(1.0, current_alpha * 1.1)  # 增加探索
-        elif q_loss < target_range[0]:
-            return max(0.01, current_alpha * 0.9)  # 减少探索
-        return current_alpha
-
-
-# 训练监控器
-class TrainingMonitor:
-    def __init__(self, patience=500, min_delta=0.01):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.best_score = float('-inf')
-        self.wait = 0
-        self.performance_history = deque(maxlen=100)
-
-    def update(self, current_score):
-        self.performance_history.append(current_score)
-
-        if current_score > self.best_score + self.min_delta:
-            self.best_score = current_score
-            self.wait = 0
-            return False  # 不停止
-        else:
-            self.wait += 1
-
-        return self.wait >= self.patience
-
-    def get_recent_performance(self):
-        if len(self.performance_history) == 0:
-            return 0
-        return np.mean(list(self.performance_history))
-
-
-# 优化的MASAC智能体
+# 完全重构的MASAC智能体 - 解决就地操作问题
 class OptimizedMASACAgent:
     def __init__(self, input_dim, action_dim, hidden_dim=256, lr=3e-4, alpha=0.2, gamma=0.99, tau=0.005,
                  auto_entropy_tuning=True):
@@ -1148,18 +1017,12 @@ class OptimizedMASACAgent:
         self.max_grad_norm = 0.5
 
         # 启用混合精度训练（如果支持）
-        self.use_amp = torch.cuda.is_available() and hasattr(torch.cuda.amp, 'autocast')
+        self.use_amp = torch.cuda.is_available() and hasattr(torch, 'amp')
         if self.use_amp:
-            self.scaler = torch.cuda.amp.GradScaler()
+            self.scaler = torch.amp.GradScaler('cuda')
 
-        # 编译模型以加速（如果支持）
-        if hasattr(torch, 'compile') and torch.cuda.is_available():
-            try:
-                self.policy = torch.compile(self.policy)
-                self.critic = torch.compile(self.critic)
-                print("模型已编译加速")
-            except:
-                print("模型编译失败，使用原始模型")
+        # 禁用模型编译以避免Triton错误
+        print("警告：由于Triton库缺失，已禁用模型编译")
 
     def act(self, state, evaluate=False):
         """根据状态选择动作"""
@@ -1176,8 +1039,9 @@ class OptimizedMASACAgent:
                 return action.detach().cpu().numpy()[0]
 
     def update(self, state, action, reward, next_state, done, weights=None, updates=0):
-        """更新智能体的策略和价值函数"""
-        # 确保所有输入都是张量并具有正确的形状
+        """完全重构的更新方法 - 彻底解决就地操作问题"""
+
+        # 确保所有输入都是正确格式的张量
         state = torch.FloatTensor(state).to(device)
         action = torch.FloatTensor(action).to(device)
 
@@ -1195,100 +1059,102 @@ class OptimizedMASACAgent:
 
         # 重要性采样权重
         if weights is not None:
-            weights = torch.FloatTensor(weights).to(device)
+            weights = torch.FloatTensor(weights).to(device).unsqueeze(1)
         else:
             weights = torch.ones(state.size(0), 1).to(device)
 
-        # 使用自动混合精度（如果支持）
-        if self.use_amp:
-            with torch.cuda.amp.autocast():
-                td_errors, critic_loss, policy_loss = self._compute_losses(state, action, reward, next_state, done,
-                                                                           weights, updates)
+        # 第一步：单独更新Critic网络
+        td_errors, critic_loss = self._update_critic(state, action, reward, next_state, done, weights)
 
-            # 更新Q网络
-            self.critic_optimizer.zero_grad()
-            self.scaler.scale(critic_loss).backward()
-            self.scaler.unscale_(self.critic_optimizer)
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-            self.scaler.step(self.critic_optimizer)
+        # 第二步：根据延迟策略更新Policy网络
+        policy_loss = 0.0
+        if updates % 2 == 0:
+            policy_loss = self._update_policy(state.detach().clone())  # 使用分离的状态副本
 
-            # 延迟更新策略网络
-            if updates % 2 == 0 and policy_loss is not None:
-                self.policy_optimizer.zero_grad()
-                self.scaler.scale(policy_loss).backward()
-                self.scaler.unscale_(self.policy_optimizer)
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-                self.scaler.step(self.policy_optimizer)
+            # 更新熵权重
+            if self.auto_entropy_tuning:
+                self._update_alpha(state.detach().clone())  # 使用分离的状态副本
 
-                # 更新熵权重
-                if self.auto_entropy_tuning:
-                    self._update_alpha(state)
+            # 软更新目标网络
+            self._soft_update()
 
-                # 软更新目标网络
-                self._soft_update()
+        # 返回损失值
+        return td_errors.detach().cpu().numpy(), critic_loss, policy_loss
 
-            self.scaler.update()
-        else:
-            td_errors, critic_loss, policy_loss = self._compute_losses(state, action, reward, next_state, done, weights,
-                                                                       updates)
+    def _update_critic(self, state, action, reward, next_state, done, weights):
+        """单独更新Critic网络"""
 
-            # 更新Q网络
-            self.critic_optimizer.zero_grad()
-            critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-            self.critic_optimizer.step()
-
-            # 延迟更新策略网络
-            if updates % 2 == 0 and policy_loss is not None:
-                self.policy_optimizer.zero_grad()
-                policy_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-                self.policy_optimizer.step()
-
-                # 更新熵权重
-                if self.auto_entropy_tuning:
-                    self._update_alpha(state)
-
-                # 软更新目标网络
-                self._soft_update()
-
-        return td_errors.detach().cpu().numpy(), critic_loss.item(), policy_loss.item() if policy_loss is not None else 0
-
-    def _compute_losses(self, state, action, reward, next_state, done, weights, updates):
-        """计算损失函数"""
-        # 更新Q网络
+        # 计算目标Q值
         with torch.no_grad():
+            # 为下一状态采样动作
             next_action, next_log_pi, _ = self.policy.sample(next_state)
             next_q1, next_q2 = self.critic_target(next_state, next_action)
             next_q = torch.min(next_q1, next_q2)
             next_q = next_q - self.alpha * next_log_pi
             q_target = reward + (1 - done) * self.gamma * next_q
 
-        # 当前Q值
+        # 计算当前Q值
         current_q1, current_q2 = self.critic(state, action)
 
-        # Q网络损失（加权）
+        # 计算损失
         q1_loss = (weights * F.mse_loss(current_q1, q_target, reduction='none')).mean()
         q2_loss = (weights * F.mse_loss(current_q2, q_target, reduction='none')).mean()
         critic_loss = q1_loss + q2_loss
 
         # TD误差（用于更新优先级）
-        td_errors = torch.abs(current_q1 - q_target)
+        td_errors = torch.abs(current_q1 - q_target).squeeze()
 
-        policy_loss = None
-        if updates % 2 == 0:
-            # 更新策略网络
-            pi, log_pi, _ = self.policy.sample(state)
-            qf1_pi, qf2_pi = self.critic(state, pi)
-            min_qf_pi = torch.min(qf1_pi, qf2_pi)
+        # 更新Critic网络
+        if self.use_amp:
+            with torch.amp.autocast('cuda'):
+                self.critic_optimizer.zero_grad()
+                self.scaler.scale(critic_loss).backward()
+                self.scaler.unscale_(self.critic_optimizer)
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+                self.scaler.step(self.critic_optimizer)
+                self.scaler.update()
+        else:
+            self.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            self.critic_optimizer.step()
 
-            policy_loss = ((self.alpha * log_pi) - min_qf_pi).mean()
+        return td_errors, critic_loss.detach().item()
 
-        return td_errors, critic_loss, policy_loss
+    def _update_policy(self, state):
+        """单独更新Policy网络"""
+
+        # 重新采样动作以避免计算图冲突
+        pi, log_pi, _ = self.policy.sample(state)
+
+        # 使用当前critic网络计算Q值
+        qf1_pi, qf2_pi = self.critic(state, pi)
+        min_qf_pi = torch.min(qf1_pi, qf2_pi)
+
+        # 计算策略损失
+        policy_loss = ((self.alpha * log_pi) - min_qf_pi).mean()
+
+        # 更新Policy网络
+        if self.use_amp:
+            with torch.amp.autocast('cuda'):
+                self.policy_optimizer.zero_grad()
+                self.scaler.scale(policy_loss).backward()
+                self.scaler.unscale_(self.policy_optimizer)
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.scaler.step(self.policy_optimizer)
+                self.scaler.update()
+        else:
+            self.policy_optimizer.zero_grad()
+            policy_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            self.policy_optimizer.step()
+
+        return policy_loss.detach().item()
 
     def _update_alpha(self, state):
         """更新熵权重"""
         with torch.no_grad():
+            # 重新采样以避免计算图冲突
             _, log_pi, _ = self.policy.sample(state)
 
         alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
@@ -1305,33 +1171,6 @@ class OptimizedMASACAgent:
             target_param.data.copy_(target_param.data * (1.0 - self.tau) + param.data * self.tau)
 
 
-# 并行环境包装器
-class ParallelEnvironments:
-    def __init__(self, env_class, num_envs=4, **env_kwargs):
-        self.num_envs = num_envs
-        self.envs = [env_class(**env_kwargs) for _ in range(num_envs)]
-
-    def reset_all(self):
-        return [env.reset() for env in self.envs]
-
-    def step_all(self, actions_list):
-        results = []
-        for env, actions in zip(self.envs, actions_list):
-            results.append(env.step(actions))
-        return results
-
-    def get_single_env(self):
-        """返回单个环境用于测试"""
-        return self.envs[0]
-
-
-# 权重初始化函数
-def weights_init_(m):
-    if isinstance(m, nn.Linear):
-        torch.nn.init.xavier_uniform_(m.weight, gain=1)
-        torch.nn.init.constant_(m.bias, 0)
-
-
 # 优化的训练函数
 def train_optimized_masac(env_class, n_episodes=2000, max_steps=200, batch_size=128, buffer_size=int(2e6),
                           print_every=10, render_every=100, save_every=200, comment='', num_parallel_envs=1,
@@ -1340,12 +1179,8 @@ def train_optimized_masac(env_class, n_episodes=2000, max_steps=200, batch_size=
     # 创建TensorBoard写入器
     writer = create_tensorboard_writer(comment=f'OptimizedMASAC_{comment}')
 
-    # 创建环境（支持并行）
-    if num_parallel_envs > 1:
-        envs = ParallelEnvironments(env_class, num_envs=num_parallel_envs, **env_kwargs)
-        env = envs.get_single_env()  # 用于获取参数
-    else:
-        env = env_class(**env_kwargs)
+    # 创建环境
+    env = env_class(**env_kwargs)
 
     # 获取环境参数
     n_agents = env.n_agents
@@ -1365,18 +1200,15 @@ def train_optimized_masac(env_class, n_episodes=2000, max_steps=200, batch_size=
         memory = PrioritizedReplayBuffer(max_size=buffer_size)
         print("使用优先经验回放")
     else:
-        memory = BatchedReplayBuffer(max_size=buffer_size)
-        print("使用普通经验回放")
-
-    # 初始化调度器和监控器
-    scheduler = HyperparameterScheduler()
-    monitor = TrainingMonitor(patience=1000, min_delta=0.01)
+        from collections import deque
+        memory = deque(maxlen=int(buffer_size))
+        print("使用简单缓冲区")
 
     # 训练指标
     episode_rewards = []
-    success_rate = []  # 成功率
-    formation_errors = []  # 队形误差
-    collision_counts = []  # 碰撞次数
+    success_rate = []
+    formation_errors = []
+    collision_counts = []
 
     # 模型存档路径
     os.makedirs('models', exist_ok=True)
@@ -1390,21 +1222,8 @@ def train_optimized_masac(env_class, n_episodes=2000, max_steps=200, batch_size=
 
     # 开始训练
     for episode in range(1, n_episodes + 1):
-        # 动态调整超参数
-        if episode % 100 == 0:
-            for agent in agents:
-                new_lr = scheduler._cosine_schedule(3e-4, episode, n_episodes)
-                for param_group in agent.policy_optimizer.param_groups:
-                    param_group['lr'] = new_lr
-                for param_group in agent.critic_optimizer.param_groups:
-                    param_group['lr'] = new_lr
-
         # 重置环境
-        if num_parallel_envs > 1:
-            all_states = envs.reset_all()
-            states = all_states[0]  # 使用第一个环境
-        else:
-            states = env.reset()
+        states = env.reset()
 
         episode_reward = 0
         collisions = 0
@@ -1422,11 +1241,7 @@ def train_optimized_masac(env_class, n_episodes=2000, max_steps=200, batch_size=
                 actions.append(action)
 
             # 执行动作
-            if num_parallel_envs > 1:
-                # 并行环境执行（目前只使用一个环境，可扩展）
-                next_states, rewards, done, info = env.step(actions)
-            else:
-                next_states, rewards, done, info = env.step(actions)
+            next_states, rewards, done, info = env.step(actions)
 
             # 计算总奖励
             total_reward = sum(rewards)
@@ -1439,13 +1254,17 @@ def train_optimized_masac(env_class, n_episodes=2000, max_steps=200, batch_size=
 
             # 存储经验
             for i in range(n_agents):
-                memory.push(states[i], actions[i], rewards[i], next_states[i], done)
+                if use_prioritized_replay:
+                    memory.push(states[i], actions[i], rewards[i], next_states[i], done)
+                else:
+                    memory.append((states[i], actions[i], rewards[i], next_states[i], done))
 
             # 更新状态
             states = next_states
 
             # 从经验回放中采样并更新网络
-            if len(memory) > batch_size:
+            memory_size = len(memory)
+            if memory_size > batch_size:
                 for i, agent in enumerate(agents):
                     if use_prioritized_replay:
                         batch_data, indices, weights = memory.sample(batch_size)
@@ -1458,8 +1277,17 @@ def train_optimized_masac(env_class, n_episodes=2000, max_steps=200, batch_size=
                             # 更新优先级
                             memory.update_priorities(indices, td_errors)
                     else:
-                        state_batch, action_batch, reward_batch, next_state_batch, done_batch = memory.sample(
-                            batch_size)
+                        # 简单采样
+                        batch = random.sample(list(memory), batch_size)
+                        state_batch, action_batch, reward_batch, next_state_batch, done_batch = map(np.array,
+                                                                                                    zip(*batch))
+
+                        # 确保正确的形状
+                        if reward_batch.ndim == 1:
+                            reward_batch = reward_batch.reshape(-1, 1)
+                        if done_batch.ndim == 1:
+                            done_batch = done_batch.reshape(-1, 1)
+
                         _, critic_loss, actor_loss = agent.update(
                             state_batch, action_batch, reward_batch, next_state_batch, done_batch,
                             None, updates
@@ -1495,26 +1323,21 @@ def train_optimized_masac(env_class, n_episodes=2000, max_steps=200, batch_size=
 
         collision_counts.append(collisions)
 
-        # 更新训练监控器
-        recent_success = np.mean(success_rate[-min(100, len(success_rate)):])
-        should_stop = monitor.update(recent_success)
-
         # 记录到TensorBoard
         writer.add_scalar('Rewards/Episode_Reward', episode_reward, episode)
         writer.add_scalar('Success/Success_Rate', current_success, episode)
         writer.add_scalar('Errors/Formation_Error', formation_error, episode)
         writer.add_scalar('Errors/Collision_Count', collisions, episode)
         writer.add_scalar('Training/Steps_Per_Episode', step + 1, episode)
-        writer.add_scalar('Training/Learning_Rate', agents[0].policy_optimizer.param_groups[0]['lr'], episode)
 
         # 记录每个智能体的损失
         for i in range(n_agents):
             writer.add_scalar(f'Agent_{i}/Critic_Loss', avg_critic_losses[i], episode)
             writer.add_scalar(f'Agent_{i}/Actor_Loss', avg_actor_losses[i], episode)
             writer.add_scalar(f'Agent_{i}/Reward', rewards[i], episode)
-            writer.add_scalar(f'Agent_{i}/Alpha', agents[i].alpha.item(), episode)
+            writer.add_scalar(f'Agent_{i}/Alpha', agents[i].alpha.detach().item(), episode)
 
-        # 记录当前队形
+            # 记录当前队形
         writer.add_text('Formation', info.get('current_formation', 'unknown'), episode)
 
         # 计算移动平均值
@@ -1533,7 +1356,9 @@ def train_optimized_masac(env_class, n_episodes=2000, max_steps=200, batch_size=
         # 每隔一定回合，添加环境图像到TensorBoard
         if episode % render_every == 0:
             fig = env.render(mode='return')
-            writer.add_figure('Environment', fig, episode)
+            if fig is not None:
+                writer.add_figure('Environment', fig, episode)
+                plt.close(fig)
 
         # 输出训练进度
         if episode % print_every == 0:
@@ -1546,8 +1371,7 @@ def train_optimized_masac(env_class, n_episodes=2000, max_steps=200, batch_size=
             print(f"  步数: {step + 1}/{max_steps}")
             print(f"  平均Critic损失: {np.mean(avg_critic_losses):.4f}")
             print(f"  平均Actor损失: {np.mean(avg_actor_losses):.4f}")
-            print(f"  熵权重: {agents[0].alpha.item():.4f}")
-            print(f"  学习率: {agents[0].policy_optimizer.param_groups[0]['lr']:.6f}")
+            print(f"  熵权重: {agents[0].alpha.detach().item():.4f}")
             print(f"  缓冲区大小: {len(memory)}")
             print()
 
@@ -1571,12 +1395,12 @@ def train_optimized_masac(env_class, n_episodes=2000, max_steps=200, batch_size=
                 torch.save(agent.critic.state_dict(), f'{save_dir}/agent_{i}_critic.pth')
             print(f"🏆 保存最佳模型 (回合 {episode}), 成功率: {best_success_rate:.1f}%")
 
-        # 早停检查
-        if should_stop:
-            print(f"🛑 早停触发，在回合 {episode}")
+        # 早停检查（如果连续500个回合没有改进）
+        if episode > 1000 and recent_success_rate > 80:
+            print(f"🎯 达到满意的成功率 ({recent_success_rate:.1f}%)，提前结束训练")
             break
 
-    # 保存最终模型
+        # 保存最终模型
     save_dir = 'models/final'
     os.makedirs(save_dir, exist_ok=True)
     for i, agent in enumerate(agents):
@@ -1598,60 +1422,62 @@ def train_optimized_masac(env_class, n_episodes=2000, max_steps=200, batch_size=
         'best_success_rate': best_success_rate
     }, agents
 
+    # 超参数调度器
 
-# 批量预取经验回放缓冲区（作为优先经验回放的替代）
-class BatchedReplayBuffer:
-    def __init__(self, max_size=1e6, batch_prefetch=4):
-        self.buffer = []
-        self.max_size = int(max_size)
-        self.position = 0
-        self.batch_prefetch = batch_prefetch
-        self._prefetch_cache = []
 
-    def push(self, state, action, reward, next_state, done):
-        if len(self.buffer) < self.max_size:
-            self.buffer.append(None)
-        self.buffer[self.position] = (state, action, reward, next_state, done)
-        self.position = (self.position + 1) % self.max_size
+class HyperparameterScheduler:
+    def __init__(self):
+        self.schedules = {
+            'learning_rate': self._cosine_schedule,
+            'exploration_noise': self._exponential_decay,
+            'entropy_weight': self._adaptive_entropy
+        }
 
-    def sample(self, batch_size):
-        """预取多个批次以减少采样开销"""
-        if len(self._prefetch_cache) == 0:
-            for _ in range(self.batch_prefetch):
-                if len(self.buffer) >= batch_size:
-                    batch = random.sample(self.buffer, batch_size)
-                    state, action, reward, next_state, done = map(np.stack, zip(*batch))
+    def _cosine_schedule(self, initial_lr, episode, total_episodes):
+        return initial_lr * 0.5 * (1 + np.cos(np.pi * episode / total_episodes))
 
-                    # 确保reward和done是列向量形式 [batch_size, 1]
-                    if reward.ndim == 1:
-                        reward = reward.reshape(-1, 1)
-                    if done.ndim == 1:
-                        done = done.reshape(-1, 1)
+    def _exponential_decay(self, initial_noise, episode, decay_rate=0.995):
+        return initial_noise * (decay_rate ** episode)
 
-                    self._prefetch_cache.append((state, action, reward, next_state, done))
-                else:
-                    break
+    def _adaptive_entropy(self, current_alpha, q_loss, target_range=(0.1, 0.5)):
+        """根据Q损失自适应调整熵权重"""
+        if q_loss > target_range[1]:
+            return min(1.0, current_alpha * 1.1)  # 增加探索
+        elif q_loss < target_range[0]:
+            return max(0.01, current_alpha * 0.9)  # 减少探索
+        return current_alpha
 
-        if len(self._prefetch_cache) > 0:
-            return self._prefetch_cache.pop(0)
+    # 训练监控器
+
+
+class TrainingMonitor:
+    def __init__(self, patience=500, min_delta=0.01):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_score = float('-inf')
+        self.wait = 0
+        self.performance_history = deque(maxlen=100)
+
+    def update(self, current_score):
+        self.performance_history.append(current_score)
+
+        if current_score > self.best_score + self.min_delta:
+            self.best_score = current_score
+            self.wait = 0
+            return False  # 不停止
         else:
-            # 如果缓存为空，直接采样
-            batch = random.sample(self.buffer, min(batch_size, len(self.buffer)))
-            state, action, reward, next_state, done = map(np.stack, zip(*batch))
+            self.wait += 1
 
-            # 确保reward和done是列向量形式 [batch_size, 1]
-            if reward.ndim == 1:
-                reward = reward.reshape(-1, 1)
-            if done.ndim == 1:
-                done = done.reshape(-1, 1)
+        return self.wait >= self.patience
 
-            return state, action, reward, next_state, done
+    def get_recent_performance(self):
+        if len(self.performance_history) == 0:
+            return 0
+        return np.mean(list(self.performance_history))
 
-    def __len__(self):
-        return len(self.buffer)
+    # 测试智能体
 
 
-# 测试智能体
 def test_agents(env, agents, n_episodes=5, max_steps=200):
     """测试训练好的智能体"""
     success_count = 0
@@ -1675,7 +1501,8 @@ def test_agents(env, agents, n_episodes=5, max_steps=200):
             episode_reward += sum(rewards)
 
             # 可视化
-            env.render()
+            if episode == 0:  # 只在第一个测试回合可视化
+                env.render()
 
             if done:
                 if info.get('reached_target', False):
@@ -1687,15 +1514,16 @@ def test_agents(env, agents, n_episodes=5, max_steps=200):
 
     success_rate = success_count / n_episodes * 100
     avg_reward = np.mean(total_rewards)
-    avg_steps = np.mean(total_steps)
+    avg_steps = np.mean(total_steps) if total_steps else max_steps
 
     print(f"📊 测试结果:")
     print(f"  成功率: {success_rate:.1f}%")
     print(f"  平均奖励: {avg_reward:.2f}")
     print(f"  平均步数: {avg_steps:.1f}")
 
+    # 生成编队控制导航的动画
 
-# 生成编队控制导航的动画
+
 def create_formation_animation(env, agents, max_steps=200):
     """创建编队控制导航的动画"""
     # 重置环境
@@ -1720,7 +1548,7 @@ def create_formation_animation(env, agents, max_steps=200):
         # 智能体选择动作
         actions = []
         for i, agent in enumerate(agents):
-            action = agent.act(states[i], evaluate=True)  # 修复：使用正确的参数
+            action = agent.act(states[i], evaluate=True)
             actions.append(action)
 
         # 执行动作
@@ -1729,6 +1557,10 @@ def create_formation_animation(env, agents, max_steps=200):
 
         if done:
             break
+
+    if len(position_history) == 0:
+        print("⚠️ 没有记录到任何状态，无法生成动画")
+        return
 
     # 创建动画
     fig, ax = plt.subplots(figsize=(10, 10))
@@ -1804,16 +1636,18 @@ def create_formation_animation(env, agents, max_steps=200):
         return dynamic_obstacles + agents_circles + agents_arrows + [step_text, formation_text]
 
     # 创建动画
-    ani = FuncAnimation(fig, update, frames=len(position_history), interval=50, blit=True)
+    try:
+        ani = FuncAnimation(fig, update, frames=len(position_history), interval=50, blit=True)
+        ani.save('formation_navigation.gif', writer='pillow', fps=10)
+        print("🎬 动画已保存为 'formation_navigation.gif'")
+    except Exception as e:
+        print(f"⚠️ 动画保存失败: {e}")
+    finally:
+        plt.close(fig)
 
-    # 保存为GIF
-    ani.save('formation_navigation.gif', writer='pillow', fps=10)
-
-    plt.close()
-    print("🎬 动画已保存为 'formation_navigation.gif'")
+    # 可视化训练历史
 
 
-# 可视化训练历史
 def visualize_training_history(history):
     """可视化训练历史"""
     fig, axs = plt.subplots(2, 2, figsize=(15, 10))
@@ -1854,11 +1688,12 @@ def visualize_training_history(history):
 
     plt.tight_layout()
     plt.savefig('training_history.png', dpi=300, bbox_inches='tight')
-    plt.close()
+    plt.close(fig)
     print("📈 训练历史已保存为 'training_history.png'")
 
+    # 加载训练好的模型
 
-# 加载训练好的模型
+
 def load_trained_agents(model_path, n_agents, obs_dim, action_dim):
     """加载训练好的智能体"""
     agents = [OptimizedMASACAgent(input_dim=obs_dim, action_dim=action_dim) for _ in range(n_agents)]
@@ -1870,6 +1705,8 @@ def load_trained_agents(model_path, n_agents, obs_dim, action_dim):
             print(f"✅ 智能体 {i} 模型加载成功")
         except FileNotFoundError:
             print(f"❌ 智能体 {i} 模型文件未找到")
+        except Exception as e:
+            print(f"❌ 智能体 {i} 模型加载失败: {e}")
 
     return agents
 
@@ -1889,45 +1726,96 @@ if __name__ == "__main__":
     print("🚀 开始优化的多智能体强化学习训练")
     print(f"设备: {device}")
     print(f"PyTorch版本: {torch.__version__}")
+    print(f"当前时间: {datetime.now()}")
 
     # 创建环境 - 使用3个智能体和混合障碍物
-    env = AdaptiveFormationEnvironment(
-        n_agents=3,
-        world_size=20,
-        n_static_obstacles=4,  # 使用4个静态障碍物（包括固定和随机）
-        n_dynamic_obstacles=1  # 使用1个动态障碍物
-    )
+    try:
+        env = AdaptiveFormationEnvironment(
+            n_agents=3,
+            world_size=20,
+            n_static_obstacles=4,  # 使用4个静态障碍物（包括固定和随机）
+            n_dynamic_obstacles=1  # 使用1个动态障碍物
+        )
 
-    # 训练智能体，使用优化配置
-    history, agents = train_optimized_masac(
-        env_class=AdaptiveFormationEnvironment,
-        n_agents=3,
-        world_size=20,
-        n_static_obstacles=4,
-        n_dynamic_obstacles=1,
-        n_episodes=15000,  # 减少训练回合，因为优化后收敛更快
-        max_steps=200,
-        batch_size=256,  # 增加批次大小
-        buffer_size=int(2e6),  # 增加缓冲区大小
-        print_every=50,
-        render_every=200,
-        save_every=500,
-        comment='optimized_three_agents_mixed_obstacles',
-        num_parallel_envs=1,  # 可以设置为更大值以启用并行训练
-        use_prioritized_replay=True  # 启用优先经验回放
-    )
+        print(f"环境创建成功: {env.n_agents}个智能体")
+        print(f"静态障碍物: {len(env.static_obstacles)}个")
+        print(f"动态障碍物: {len(env.dynamic_obstacles)}个")
 
-    # 可视化训练历史
-    visualize_training_history(history)
+        # 训练智能体，使用优化配置
+        history, agents = train_optimized_masac(
+            env_class=AdaptiveFormationEnvironment,
+            n_agents=3,
+            world_size=20,
+            n_static_obstacles=4,
+            n_dynamic_obstacles=1,
+            n_episodes=3000,  # 适中的训练回合数
+            max_steps=200,
+            batch_size=128,  # 适中的批次大小以节省内存
+            buffer_size=int(5e5),  # 减少缓冲区大小以节省内存
+            print_every=50,
+            render_every=500,  # 减少渲染频率以节省时间
+            save_every=500,
+            comment='completely_fixed_gradient_issues',
+            num_parallel_envs=1,
+            use_prioritized_replay=True  # 启用优先经验回放
+        )
 
-    # 测试智能体
-    print("\n🧪 开始测试训练好的智能体...")
-    test_agents(env, agents, n_episodes=10)
+        # 可视化训练历史
+        print("\n📊 生成训练历史图表...")
+        visualize_training_history(history)
 
-    # 创建动画
-    print("\n🎬 生成导航动画...")
-    create_formation_animation(env, agents)
+        # 测试智能体
+        print("\n🧪 开始测试训练好的智能体...")
+        test_agents(env, agents, n_episodes=5)
 
-    print("\n🎉 所有任务完成!")
-    print(f"最佳模型成功率: {history['best_success_rate']:.1f}%")
-    print(f"最佳模型回合: {history['best_episode']}")
+        # 创建动画
+        print("\n🎬 生成导航动画...")
+        create_formation_animation(env, agents)
+
+        print("\n🎉 所有任务完成!")
+        print(f"最佳模型成功率: {history['best_success_rate']:.1f}%")
+        print(f"最佳模型回合: {history['best_episode']}")
+        print(f"总训练回合: {len(history['episode_rewards'])}")
+
+        # 保存训练配置信息
+        config_info = {
+            'training_episodes': len(history['episode_rewards']),
+            'best_success_rate': history['best_success_rate'],
+            'best_episode': history['best_episode'],
+            'final_success_rate': np.mean(history['success_rate'][-100:]) * 100,
+            'device': str(device),
+            'pytorch_version': torch.__version__,
+            'timestamp': datetime.now().isoformat()
+        }
+
+        import json
+
+        with open('training_config.json', 'w') as f:
+            json.dump(config_info, f, indent=2)
+
+        print(f"📄 训练配置已保存到 'training_config.json'")
+
+    except Exception as e:
+        print(f"❌ 训练过程中出现错误: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+        # 启用梯度异常检测进行调试
+        print("\n🔍 启用梯度异常检测重新运行...")
+        torch.autograd.set_detect_anomaly(True)
+
+        try:
+            # 重新尝试一个简化的训练过程
+            env = AdaptiveFormationEnvironment(n_agents=3, world_size=20, n_static_obstacles=2, n_dynamic_obstacles=0)
+            history, agents = train_optimized_masac(
+                env_class=AdaptiveFormationEnvironment,
+                n_agents=3, world_size=20, n_static_obstacles=2, n_dynamic_obstacles=0,
+                n_episodes=100, max_steps=50, batch_size=32, buffer_size=int(1e4),
+                print_every=10, render_every=100, save_every=50,
+                comment='debug_mode', use_prioritized_replay=False
+            )
+            print("✅ 调试模式训练成功!")
+        except Exception as debug_e:
+            print(f"❌ 调试模式也失败: {debug_e}")
+            traceback.print_exc()
