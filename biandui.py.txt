@@ -5,13 +5,14 @@ import torch.optim as optim
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-from matplotlib.patches import Circle, Rectangle
+from matplotlib.patches import Circle
 import math
 import random
 import os
 import sys
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
+from torch.distributions import Normal
 
 # 设备配置
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -23,46 +24,6 @@ def create_tensorboard_writer(comment=''):
     current_time = datetime.now().strftime('%Y%m%d-%H%M%S')
     log_dir = os.path.join('runs', f'{current_time}_{comment}')
     return SummaryWriter(log_dir=log_dir)
-
-
-# 课程学习管理器 - 新增
-class CurriculumManager:
-    """课程学习管理器 - 逐步增加任务难度"""
-
-    def __init__(self, initial_static_obstacles=2, initial_dynamic_obstacles=0,
-                 max_static_obstacles=8, max_dynamic_obstacles=3,
-                 success_threshold=0.7, interval=100):
-        self.static_obstacles = initial_static_obstacles
-        self.dynamic_obstacles = initial_dynamic_obstacles
-        self.max_static_obstacles = max_static_obstacles
-        self.max_dynamic_obstacles = max_dynamic_obstacles
-        self.success_threshold = success_threshold
-        self.interval = interval
-        self.success_history = []
-
-    def update(self, episode, success):
-        """更新课程难度"""
-        self.success_history.append(success)
-
-        # 每隔一定回合评估一次
-        if episode % self.interval == 0 and episode > 0:
-            # 计算最近的成功率
-            recent_success_rate = np.mean(self.success_history[-self.interval:])
-
-            if recent_success_rate >= self.success_threshold:
-                # 成功率高，增加难度
-                if self.static_obstacles < self.max_static_obstacles:
-                    self.static_obstacles += 1
-                    return True
-                elif self.dynamic_obstacles < self.max_dynamic_obstacles:
-                    self.dynamic_obstacles += 1
-                    return True
-
-        return False
-
-    def get_obstacles_count(self):
-        """获取当前障碍物数量"""
-        return self.static_obstacles, self.dynamic_obstacles
 
 
 class AdaptiveFormationEnvironment:
@@ -801,7 +762,7 @@ class AdaptiveFormationEnvironment:
 
     def render(self, mode='human'):
         """可视化当前环境状态"""
-        plt.figure(figsize=(10, 10))
+        fig = plt.figure(figsize=(10, 10))
         plt.xlim(0, self.world_size)
         plt.ylim(0, self.world_size)
 
@@ -856,110 +817,165 @@ class AdaptiveFormationEnvironment:
 
         if mode == 'human':
             plt.savefig(f'formation_step_{self.current_step:03d}.png')
-            plt.close()
+            plt.close(fig)
             return None
         elif mode == 'return':
-            return plt.gcf()
+            return fig
         else:
-            return plt.gcf()
+            plt.close(fig)
+            return None
 
 
-# DDPG智能体的Actor网络
-class Actor(nn.Module):
-    def __init__(self, input_dim, action_dim, hidden_dim=256, init_w=3e-3):
-        super(Actor, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, action_dim)
+# MASAC的Actor网络 - 替代原MADDPG的Actor
+class GaussianPolicy(nn.Module):
+    def __init__(self, input_dim, action_dim, hidden_dim=256, log_std_min=-20, log_std_max=2):
+        super(GaussianPolicy, self).__init__()
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
 
-        # 初始化最后一层的权重为较小的值，以确保初始动作接近0
-        self.fc3.weight.data.uniform_(-init_w, init_w)
-        self.fc3.bias.data.uniform_(-init_w, init_w)
+        # 共享网络层
+        self.linear1 = nn.Linear(input_dim, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
 
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        return torch.tanh(self.fc3(x))  # 输出范围为[-1, 1]
+        # 均值和标准差
+        self.mean_linear = nn.Linear(hidden_dim, action_dim)
+        self.log_std_linear = nn.Linear(hidden_dim, action_dim)
+
+        # 初始化
+        self.apply(weights_init_)
+
+    def forward(self, state):
+        x = F.relu(self.linear1(state))
+        x = F.relu(self.linear2(x))
+
+        mean = self.mean_linear(x)
+        log_std = self.log_std_linear(x)
+        log_std = torch.clamp(log_std, min=self.log_std_min, max=self.log_std_max)
+
+        return mean, log_std
+
+    def sample(self, state):
+        mean, log_std = self.forward(state)
+        std = log_std.exp()
+        normal = Normal(mean, std)
+
+        # 对动作空间采样
+        x_t = normal.rsample()  # reparameterization trick
+        action = torch.tanh(x_t)
+
+        # 计算对数概率
+        log_prob = normal.log_prob(x_t)
+
+        # 校正对数概率
+        log_prob -= torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(1, keepdim=True)
+
+        return action, log_prob, mean
+
+    def to(self, device):
+        return super(GaussianPolicy, self).to(device)
 
 
-# DDPG智能体的Critic网络 - 修改版本
-class Critic(nn.Module):
-    def __init__(self, input_dim, action_dim, hidden_dim=256, init_w=3e-3):
-        super(Critic, self).__init__()
-        self.fc1 = nn.Linear(input_dim + action_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, 1)
+# MASAC的Q网络 - 替代原MADDPG的Critic
+class QNetwork(nn.Module):
+    def __init__(self, input_dim, action_dim, hidden_dim=256):
+        super(QNetwork, self).__init__()
 
-        # 初始化最后一层的权重为较小的值
-        self.fc3.weight.data.uniform_(-init_w, init_w)
-        self.fc3.bias.data.uniform_(-init_w, init_w)
+        # 第一个Q网络
+        self.linear1 = nn.Linear(input_dim + action_dim, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear3 = nn.Linear(hidden_dim, 1)
+
+        # 第二个Q网络 (用于减少过估计)
+        self.linear4 = nn.Linear(input_dim + action_dim, hidden_dim)
+        self.linear5 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear6 = nn.Linear(hidden_dim, 1)
+
+        # 初始化
+        self.apply(weights_init_)
 
     def forward(self, state, action):
-        # 确保state和action是正确的批次维度
+        # 输入处理
         batch_size = state.size(0)
-
-        # 处理action的维度
         if action.dim() == 1:
             action = action.unsqueeze(0)
-
-        # 确保action的批次大小与state一致
         if action.size(0) != batch_size:
             action = action.expand(batch_size, -1)
 
-        x = torch.cat([state, action], dim=1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        return self.fc3(x)  # 输出形状为[batch_size, 1]
+        xu = torch.cat([state, action], 1)
+
+        # 第一个Q值
+        x1 = F.relu(self.linear1(xu))
+        x1 = F.relu(self.linear2(x1))
+        x1 = self.linear3(x1)
+
+        # 第二个Q值
+        x2 = F.relu(self.linear4(xu))
+        x2 = F.relu(self.linear5(x2))
+        x2 = self.linear6(x2)
+
+        return x1, x2
 
 
-# 基于MADDPG的智能体 - 修改版本
-class MADDPGAgent:
-    def __init__(self, input_dim, action_dim, hidden_dim=256, lr_actor=3e-5, lr_critic=3e-4):
-        self.actor = Actor(input_dim, action_dim, hidden_dim).to(device)
-        self.actor_target = Actor(input_dim, action_dim, hidden_dim).to(device)
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr_actor)
+# 权重初始化函数
+def weights_init_(m):
+    if isinstance(m, nn.Linear):
+        torch.nn.init.xavier_uniform_(m.weight, gain=1)
+        torch.nn.init.constant_(m.bias, 0)
 
-        self.critic = Critic(input_dim, action_dim, hidden_dim).to(device)
-        self.critic_target = Critic(input_dim, action_dim, hidden_dim).to(device)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_critic)
+
+# MASAC智能体 - 替代原MADDPG智能体
+class MASACAgent:
+    def __init__(self, input_dim, action_dim, hidden_dim=256, lr=3e-4, alpha=0.2, gamma=0.99, tau=0.005,
+                 auto_entropy_tuning=True):
+        self.gamma = gamma
+        self.tau = tau
+        self.alpha = alpha
+
+        # 自动调整熵权重
+        self.auto_entropy_tuning = auto_entropy_tuning
+
+        # 策略网络
+        self.policy = GaussianPolicy(input_dim, action_dim, hidden_dim).to(device)
+        self.policy_optimizer = optim.Adam(self.policy.parameters(), lr=lr)
+
+        # Q网络
+        self.critic = QNetwork(input_dim, action_dim, hidden_dim).to(device)
+        self.critic_target = QNetwork(input_dim, action_dim, hidden_dim).to(device)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr)
 
         # 硬拷贝参数
-        self.actor_target.load_state_dict(self.actor.state_dict())
-        self.critic_target.load_state_dict(self.critic.state_dict())
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(param.data)
 
-        self.gamma = 0.99  # 折扣因子
-        self.tau = 0.001  # 软更新参数
-
-        # 噪声参数
-        self.noise_scale = 0.3
-        self.noise_decay = 0.9995
-        self.min_noise = 0.05
+        # 自动调整熵
+        if self.auto_entropy_tuning:
+            self.target_entropy = -torch.prod(torch.Tensor([action_dim]).to(device)).item()
+            self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
+            self.alpha_optimizer = optim.Adam([self.log_alpha], lr=lr)
 
         # 梯度裁剪
         self.max_grad_norm = 0.5
 
-    def act(self, state, noise=True):
+    def act(self, state, evaluate=False):
         """根据状态选择动作"""
-        state = torch.FloatTensor(state).to(device)
-        self.actor.eval()
-        with torch.no_grad():
-            action = self.actor(state).cpu().data.numpy()
-        self.actor.train()
+        state = torch.FloatTensor(state).to(device).unsqueeze(0)
 
-        if noise:
-            # 添加探索噪声
-            action += np.random.normal(0, self.noise_scale, size=action.shape)
-            action = np.clip(action, -1, 1)
+        if evaluate:
+            # 评估模式使用均值动作
+            _, _, action = self.policy.sample(state)
+            return action.detach().cpu().numpy()[0]
+        else:
+            # 训练模式使用采样动作
+            action, _, _ = self.policy.sample(state)
+            return action.detach().cpu().numpy()[0]
 
-        return action
-
-    def update(self, state, action, reward, next_state, done):
-        """更新智能体的策略和价值函数 - 修复版本"""
+    def update(self, state, action, reward, next_state, done, updates=0):
+        """更新智能体的策略和价值函数"""
         # 确保所有输入都是张量并具有正确的形状
         state = torch.FloatTensor(state).to(device)
         action = torch.FloatTensor(action).to(device)
 
-        # 修复1: 确保reward是一个适当形状的张量 [batch_size, 1]
         reward_np = np.array(reward)
         if reward_np.ndim == 1:
             reward_np = reward_np.reshape(-1, 1)
@@ -967,59 +983,71 @@ class MADDPGAgent:
 
         next_state = torch.FloatTensor(next_state).to(device)
 
-        # 修复2: 确保done是一个适当形状的张量 [batch_size, 1]
         done_np = np.array(done)
         if done_np.ndim == 1:
             done_np = done_np.reshape(-1, 1)
         done = torch.FloatTensor(done_np).to(device)
 
-        # 更新Critic
+        # 更新Q网络
         with torch.no_grad():
-            next_action = self.actor_target(next_state)
-            # 确保target_q的形状正确 [batch_size, 1]
-            target_q = reward + (1 - done) * self.gamma * self.critic_target(next_state, next_action)
+            next_action, next_log_pi, _ = self.policy.sample(next_state)
+            next_q1, next_q2 = self.critic_target(next_state, next_action)
+            next_q = torch.min(next_q1, next_q2)
+            next_q = next_q - self.alpha * next_log_pi
+            q_target = reward + (1 - done) * self.gamma * next_q
 
-        current_q = self.critic(state, action)
+        # 当前Q值
+        current_q1, current_q2 = self.critic(state, action)
 
-        # 修复3: 确保两个张量有相同的形状用于MSE损失
-        assert target_q.shape == current_q.shape, f"Shape mismatch: {target_q.shape} vs {current_q.shape}"
-        critic_loss = F.mse_loss(current_q, target_q)
+        # Q网络损失
+        q1_loss = F.mse_loss(current_q1, q_target)
+        q2_loss = F.mse_loss(current_q2, q_target)
+        critic_loss = q1_loss + q2_loss
 
+        # 更新Q网络
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
-        # 梯度裁剪 - 防止梯度爆炸
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
         self.critic_optimizer.step()
 
-        # 更新Actor
-        actor_loss = -self.critic(state, self.actor(state)).mean()
+        # 延迟更新策略网络
+        if updates % 2 == 0:
+            # 更新策略网络
+            pi, log_pi, _ = self.policy.sample(state)
+            qf1_pi, qf2_pi = self.critic(state, pi)
+            min_qf_pi = torch.min(qf1_pi, qf2_pi)
 
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        # 梯度裁剪 - 防止梯度爆炸
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-        self.actor_optimizer.step()
+            policy_loss = ((self.alpha * log_pi) - min_qf_pi).mean()
 
-        # 软更新目标网络
-        self._soft_update(self.actor, self.actor_target)
-        self._soft_update(self.critic, self.critic_target)
+            self.policy_optimizer.zero_grad()
+            policy_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            self.policy_optimizer.step()
 
-        # 更新噪声
-        self.noise_scale = max(self.min_noise, self.noise_scale * self.noise_decay)
+            # 自动调整熵
+            if self.auto_entropy_tuning:
+                alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
 
-        return critic_loss.item(), actor_loss.item()
+                self.alpha_optimizer.zero_grad()
+                alpha_loss.backward()
+                self.alpha_optimizer.step()
 
-    def _soft_update(self, local_model, target_model):
-        """软更新目标网络参数: θ_target = τ*θ_local + (1-τ)*θ_target"""
-        for target_param, local_param in zip(target_model.parameters(), local_model.parameters()):
-            target_param.data.copy_(self.tau * local_param.data + (1.0 - self.tau) * target_param.data)
+                self.alpha = self.log_alpha.exp()
+
+            # 软更新目标网络
+            for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+                target_param.data.copy_(target_param.data * (1.0 - self.tau) + param.data * self.tau)
+
+            return critic_loss.item(), policy_loss.item()
+        else:
+            return critic_loss.item(), 0
 
 
-# 经验回放缓冲区 - 修改版本
+# 经验回放缓冲区
 class ReplayBuffer:
     def __init__(self, max_size=1e6):
         self.buffer = []
-        self.max_size = max_size
+        self.max_size = int(max_size)
         self.position = 0
 
     def push(self, state, action, reward, next_state, done):
@@ -1044,12 +1072,12 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-# 改进的训练函数 - 加入课程学习
-def train_maddpg(env, n_episodes=2000, max_steps=200, batch_size=128, buffer_size=int(1e6),
-                 print_every=10, render_every=100, save_every=200, comment=''):
-    """训练MADDPG智能体 - 改进版本，集成课程学习"""
+# 使用MASAC训练智能体
+def train_masac(env, n_episodes=2000, max_steps=200, batch_size=128, buffer_size=int(1e6),
+                print_every=10, render_every=100, save_every=200, comment=''):
+    """训练MASAC智能体"""
     # 创建TensorBoard写入器
-    writer = create_tensorboard_writer(comment=f'MADDPG_improved_{env.n_agents}agents_{comment}')
+    writer = create_tensorboard_writer(comment=f'MASAC_{env.n_agents}agents_{comment}')
 
     # 获取环境参数
     n_agents = env.n_agents
@@ -1062,18 +1090,10 @@ def train_maddpg(env, n_episodes=2000, max_steps=200, batch_size=128, buffer_siz
     print(f"观察空间维度: {obs_dim}, 动作空间维度: {action_dim}")
 
     # 初始化智能体
-    agents = [MADDPGAgent(input_dim=obs_dim, action_dim=action_dim) for _ in range(n_agents)]
+    agents = [MASACAgent(input_dim=obs_dim, action_dim=action_dim) for _ in range(n_agents)]
 
     # 初始化经验回放缓冲区
     memory = ReplayBuffer(max_size=buffer_size)
-
-    # 初始化课程学习
-    curriculum = CurriculumManager(
-        initial_static_obstacles=2,
-        initial_dynamic_obstacles=0,
-        max_static_obstacles=8,
-        max_dynamic_obstacles=3
-    )
 
     # 训练指标
     episode_rewards = []
@@ -1088,28 +1108,26 @@ def train_maddpg(env, n_episodes=2000, max_steps=200, batch_size=128, buffer_siz
     best_success_rate = 0
     best_episode = 0
 
+    # 总更新次数
+    updates = 0
+
     # 开始训练
     for episode in range(1, n_episodes + 1):
-        # 更新环境难度
-        n_static, n_dynamic = curriculum.get_obstacles_count()
-        env.n_static_obstacles = n_static
-        env.n_dynamic_obstacles = n_dynamic
-
         # 重置环境
         states = env.reset()
         episode_reward = 0
         collisions = 0
 
         # 每个智能体的损失
-        actor_losses = [0] * n_agents
         critic_losses = [0] * n_agents
+        actor_losses = [0] * n_agents
         update_counts = [0] * n_agents
 
         for step in range(max_steps):
             # 每个智能体选择动作
             actions = []
             for i, agent in enumerate(agents):
-                action = agent.act(states[i], noise=True)
+                action = agent.act(states[i])
                 actions.append(action)
 
             # 执行动作
@@ -1136,8 +1154,10 @@ def train_maddpg(env, n_episodes=2000, max_steps=200, batch_size=128, buffer_siz
                 for i, agent in enumerate(agents):
                     state_batch, action_batch, reward_batch, next_state_batch, done_batch = memory.sample(batch_size)
                     critic_loss, actor_loss = agent.update(
-                        state_batch, action_batch, reward_batch, next_state_batch, done_batch
+                        state_batch, action_batch, reward_batch, next_state_batch, done_batch, updates
                     )
+                    updates += 1
+
                     # 累计损失值
                     critic_losses[i] += critic_loss
                     actor_losses[i] += actor_loss
@@ -1172,14 +1192,13 @@ def train_maddpg(env, n_episodes=2000, max_steps=200, batch_size=128, buffer_siz
         writer.add_scalar('Errors/Formation_Error', formation_error, episode)
         writer.add_scalar('Errors/Collision_Count', collisions, episode)
         writer.add_scalar('Training/Steps_Per_Episode', step + 1, episode)
-        writer.add_scalar('Environment/Static_Obstacles', n_static, episode)
-        writer.add_scalar('Environment/Dynamic_Obstacles', n_dynamic, episode)
 
         # 记录每个智能体的损失
         for i in range(n_agents):
             writer.add_scalar(f'Agent_{i}/Critic_Loss', avg_critic_losses[i], episode)
             writer.add_scalar(f'Agent_{i}/Actor_Loss', avg_actor_losses[i], episode)
             writer.add_scalar(f'Agent_{i}/Reward', rewards[i], episode)
+            writer.add_scalar(f'Agent_{i}/Alpha', agents[i].alpha.item(), episode)
 
         # 记录当前队形
         writer.add_text('Formation', info.get('current_formation', 'unknown'), episode)
@@ -1197,12 +1216,6 @@ def train_maddpg(env, n_episodes=2000, max_steps=200, batch_size=128, buffer_siz
         writer.add_scalar('Errors/Average_Formation_Error', avg_formation_error, episode)
         writer.add_scalar('Errors/Average_Collision_Count', avg_collisions, episode)
 
-        # 更新课程
-        difficulty_changed = curriculum.update(episode, current_success)
-        if difficulty_changed:
-            writer.add_text('Curriculum', f'Episode {episode}: Static={n_static}, Dynamic={n_dynamic}', episode)
-            print(f"课程难度增加: 静态障碍物={n_static}, 动态障碍物={n_dynamic}")
-
         # 每隔一定回合，添加环境图像到TensorBoard
         if episode % render_every == 0:
             fig = env.render(mode='return')
@@ -1217,9 +1230,9 @@ def train_maddpg(env, n_episodes=2000, max_steps=200, batch_size=128, buffer_siz
             print(f"  平均碰撞次数: {avg_collisions:.2f}")
             print(f"  队形: {info.get('current_formation', 'unknown')}")
             print(f"  步数: {step + 1}/{max_steps}")
-            print(f"  平均Actor损失: {np.mean(avg_actor_losses):.4f}")
             print(f"  平均Critic损失: {np.mean(avg_critic_losses):.4f}")
-            print(f"  环境难度: 静态障碍物={n_static}, 动态障碍物={n_dynamic}")
+            print(f"  平均Actor损失: {np.mean(avg_actor_losses):.4f}")
+            print(f"  熵权重: {agents[0].alpha.item():.4f}")
             print()
 
         # 保存当前模型
@@ -1227,7 +1240,7 @@ def train_maddpg(env, n_episodes=2000, max_steps=200, batch_size=128, buffer_siz
             save_dir = f'models/episode_{episode}'
             os.makedirs(save_dir, exist_ok=True)
             for i, agent in enumerate(agents):
-                torch.save(agent.actor.state_dict(), f'{save_dir}/agent_{i}_actor.pth')
+                torch.save(agent.policy.state_dict(), f'{save_dir}/agent_{i}_policy.pth')
                 torch.save(agent.critic.state_dict(), f'{save_dir}/agent_{i}_critic.pth')
 
         # 保存最佳模型
@@ -1238,7 +1251,7 @@ def train_maddpg(env, n_episodes=2000, max_steps=200, batch_size=128, buffer_siz
             save_dir = 'models/best'
             os.makedirs(save_dir, exist_ok=True)
             for i, agent in enumerate(agents):
-                torch.save(agent.actor.state_dict(), f'{save_dir}/agent_{i}_actor.pth')
+                torch.save(agent.policy.state_dict(), f'{save_dir}/agent_{i}_policy.pth')
                 torch.save(agent.critic.state_dict(), f'{save_dir}/agent_{i}_critic.pth')
             print(f"保存最佳模型 (回合 {episode}), 成功率: {best_success_rate:.1f}%")
 
@@ -1246,7 +1259,7 @@ def train_maddpg(env, n_episodes=2000, max_steps=200, batch_size=128, buffer_siz
     save_dir = 'models/final'
     os.makedirs(save_dir, exist_ok=True)
     for i, agent in enumerate(agents):
-        torch.save(agent.actor.state_dict(), f'{save_dir}/agent_{i}_actor.pth')
+        torch.save(agent.policy.state_dict(), f'{save_dir}/agent_{i}_policy.pth')
         torch.save(agent.critic.state_dict(), f'{save_dir}/agent_{i}_critic.pth')
 
     print(f"训练完成! 最佳模型在回合 {best_episode} 的成功率: {best_success_rate:.1f}%")
@@ -1277,7 +1290,7 @@ def test_agents(env, agents, n_episodes=5, max_steps=200):
             # 智能体选择动作
             actions = []
             for i, agent in enumerate(agents):
-                action = agent.act(states[i], noise=False)  # 测试时不使用噪声
+                action = agent.act(states[i], evaluate=True)  # 测试时使用确定性动作
                 actions.append(action)
 
             # 执行动作
@@ -1294,6 +1307,7 @@ def test_agents(env, agents, n_episodes=5, max_steps=200):
 
     success_rate = success_count / n_episodes * 100
     print(f"测试成功率: {success_rate:.1f}%")
+
 
 
 # 生成编队控制导航的动画
@@ -1313,6 +1327,148 @@ def create_formation_animation(env, agents, max_steps=200):
         position_history.append(env.positions.copy())
         velocity_history.append(env.velocities.copy())
         formation_history.append(env.current_formation)
+        dynamic_obstacle_history.append([
+            {'position': obs['position'].copy(), 'radius': obs['radius'], 'velocity': obs['velocity'].copy()}
+            for obs in env.dynamic_obstacles
+        ])
+
+        # 智能体选择动作
+        actions = []
+        for i, agent in enumerate(agents):
+            action = agent.act(states[i], noise=True)
+            actions.append(action)
+
+        # 执行动作
+        next_states, rewards, done, info = env.step(actions)
+        states = next_states
+
+        if done:
+            break
+
+    # 创建动画
+    fig, ax = plt.subplots(figsize=(10, 10))
+
+    # 设置边界
+    ax.set_xlim(0, env.world_size)
+    ax.set_ylim(0, env.world_size)
+
+    # 绘制静态障碍物
+    for obstacle in env.static_obstacles:
+        circle = plt.Circle(obstacle['position'], obstacle['radius'], color='gray', alpha=0.7)
+        ax.add_artist(circle)
+
+    # 绘制目标位置
+    target = plt.plot(env.target_position[0], env.target_position[1], 'x', color='red', markersize=15)[0]
+    ax.text(env.target_position[0], env.target_position[1] + 1, "Target", fontsize=12)
+
+    # 初始化动态障碍物
+    dynamic_obstacles = []
+    for _ in env.dynamic_obstacles:
+        obstacle = plt.Circle((0, 0), 0, color='orange', alpha=0.7)
+        ax.add_artist(obstacle)
+        dynamic_obstacles.append(obstacle)
+
+    # 初始化智能体
+    colors = ['b', 'g', 'r', 'c', 'm', 'y', 'k']
+    agents_circles = []
+    agents_arrows = []
+
+    for i in range(env.n_agents):
+        agent_circle = plt.Circle((0, 0), env.agent_radius, color=colors[i % len(colors)], alpha=0.7)
+        ax.add_artist(agent_circle)
+        agents_circles.append(agent_circle)
+
+        agent_arrow = ax.arrow(0, 0, 0, 0, head_width=0.2, head_length=0.3, fc=colors[i % len(colors)],
+                               ec=colors[i % len(colors)])
+        agents_arrows.append(agent_arrow)
+
+    # 添加文本标签
+    step_text = ax.text(0.02, 0.95, '', transform=ax.transAxes)
+    formation_text = ax.text(0.02, 0.90, '', transform=ax.transAxes)
+
+    def update(frame):
+        # 更新动态障碍物
+        for i, obstacle in enumerate(dynamic_obstacles):
+            if i < len(dynamic_obstacle_history[frame]):
+                obs_data = dynamic_obstacle_history[frame][i]
+                obstacle.center = obs_data['position']
+                obstacle.radius = obs_data['radius']
+
+        # 更新智能体
+        for i in range(env.n_agents):
+            # 更新位置
+            agents_circles[i].center = position_history[frame][i]
+
+            # 移除旧的箭头，创建新的箭头
+            agents_arrows[i].remove()
+            agents_arrows[i] = ax.arrow(
+                position_history[frame][i][0],
+                position_history[frame][i][1],
+                velocity_history[frame][i][0] * 2,
+                velocity_history[frame][i][1] * 2,
+                head_width=0.2,
+                head_length=0.3,
+                fc=colors[i % len(colors)],
+                ec=colors[i % len(colors)]
+            )
+
+        # 更新文本
+        step_text.set_text(f'Step: {frame + 1}/{len(position_history)}')
+        formation_text.set_text(f'Formation: {formation_history[frame]}')
+
+        return dynamic_obstacles + agents_circles + agents_arrows + [step_text, formation_text]
+
+    # 创建动画
+    ani = FuncAnimation(fig, update, frames=len(position_history), interval=50, blit=True)
+
+    # 保存为GIF
+    ani.save('formation_navigation.gif', writer='pillow', fps=10)
+
+    plt.close()
+    print("动画已保存为 'formation_navigation.gif'")
+
+
+# 可视化训练历史
+def visualize_training_history(history):
+    """可视化训练历史"""
+    fig, axs = plt.subplots(2, 2, figsize=(15, 10))
+
+    # 绘制奖励
+    axs[0, 0].plot(history['episode_rewards'])
+    axs[0, 0].set_title('Average Reward')
+    axs[0, 0].set_xlabel('Episode')
+    axs[0, 0].set_ylabel('Reward')
+    axs[0, 0].grid(True)
+
+    # 绘制成功率
+    window_size = min(100, len(history['success_rate']))
+    success_rate_moving_avg = np.convolve(history['success_rate'],
+                                          np.ones(window_size) / window_size,
+                                          mode='valid')
+    axs[0, 1].plot(success_rate_moving_avg)
+    axs[0, 1].set_title('Success Rate (Moving Average)')
+    axs[0, 1].set_xlabel('Episode')
+    axs[0, 1].set_ylabel('Success Rate')
+    axs[0, 1].set_ylim([0, 1])
+    axs[0, 1].grid(True)
+
+    # 绘制队形误差
+    axs[1, 0].plot(history['formation_errors'])
+    axs[1, 0].set_title('Formation Error')
+    axs[1, 0].set_xlabel('Episode')
+    axs[1, 0].set_ylabel('Error')
+    axs[1, 0].grid(True)
+
+    # 绘制碰撞次数
+    axs[1, 1].plot(history['collision_counts'])
+    axs[1, 1].set_title('Collision Count')
+    axs[1, 1].set_xlabel('Episode')
+    axs[1, 1].set_ylabel('Collisions')
+    axs[1, 1].grid(True)
+
+    plt.tight_layout()
+    plt.savefig('training_history.png')
+    plt.close()
 
 
 if __name__ == "__main__":
@@ -1320,13 +1476,14 @@ if __name__ == "__main__":
     os.makedirs('models', exist_ok=True)
     os.makedirs('runs', exist_ok=True)
 
-    # 创建环境
+    # 创建环境 - 使用3个智能体和混合障碍物
     env = AdaptiveFormationEnvironment(n_agents=3, world_size=20,
-                                       n_static_obstacles=8, n_dynamic_obstacles=3)
+                                       n_static_obstacles=4,  # 使用4个静态障碍物（包括固定和随机）
+                                       n_dynamic_obstacles=1)  # 使用1个动态障碍物
 
     # 训练智能体，添加自定义注释
-    history, agents = train_maddpg(env, n_episodes=20000, max_steps=200,
-                                   comment='dynamic_obstacles_v1')
+    history, agents = train_masac(env, n_episodes=20000, max_steps=200,
+                                  comment='three_agents_mixed_obstacles_sac')
 
     # 可视化训练历史
     visualize_training_history(history)
