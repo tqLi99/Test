@@ -1,3 +1,5 @@
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import numpy as np
 import torch
 import torch.nn as nn
@@ -348,8 +350,8 @@ class AdaptiveFormationEnvironment:
 
         return nearby_obstacles
 
+    """根据环境障碍物动态调整队形"""
     def _adapt_formation(self):
-        """根据环境障碍物动态调整队形"""
         # 计算智能体当前中心
         center = np.mean(self.positions, axis=0)
 
@@ -403,8 +405,8 @@ class AdaptiveFormationEnvironment:
             self.current_formation = 'triangle'
             self.formation_orientation = direction_to_target
 
+    """获取当前环境下期望的队形位置"""
     def _get_desired_formation_positions(self, scale=1.5):
-        """获取当前环境下期望的队形位置"""
         # 根据当前选择的队形生成相对位置
         formation_func = self.formation_templates[self.current_formation]
         relative_positions = formation_func()
@@ -492,6 +494,11 @@ class AdaptiveFormationEnvironment:
         if self.current_step % 5 == 0:  # 每5步调整一次队形
             self._adapt_formation()
 
+        # 初始化碰撞标志
+        collision_occurred = False
+        collision_type = None
+        collision_agent = None
+
         # 更新速度和位置
         for i in range(self.n_agents):
             # 限制动作范围
@@ -516,10 +523,12 @@ class AdaptiveFormationEnvironment:
             self.positions[i] = np.clip(self.positions[i], 0, self.world_size)
 
             # 检测碰撞
-            if self._check_collision(i):
-                # 发生碰撞，恢复位置并反弹
-                self.positions[i] = old_position
-                self.velocities[i] *= -0.5  # 碰撞后反向，并减速
+            has_collision, collision_detail = self._check_collision(i)
+            if has_collision:
+                collision_occurred = True
+                collision_type = collision_detail
+                collision_agent = i
+                break  # 发现碰撞立即停止
 
         # 计算奖励 - 使用改进的奖励计算器
         rewards = self.reward_calculator.compute_rewards()
@@ -527,8 +536,8 @@ class AdaptiveFormationEnvironment:
         # 检查是否到达目标
         reached_target = self._check_target_reached()
 
-        # 判断是否结束 - 到达目标或超过最大步数
-        done = reached_target or self.current_step >= self.max_steps
+        # 判断是否结束 - 到达目标或超过最大步数或发生碰撞
+        done = reached_target or self.current_step >= self.max_steps or collision_occurred
 
         # 获取观察
         observations = self._get_observations()
@@ -536,7 +545,10 @@ class AdaptiveFormationEnvironment:
         info = {
             'reached_target': reached_target,
             'current_formation': self.current_formation,
-            'step': self.current_step
+            'step': self.current_step,
+            'collision_occurred': collision_occurred,
+            'collision_type': collision_type,
+            'collision_agent': collision_agent
         }
 
         return observations, rewards, done, info
@@ -547,22 +559,23 @@ class AdaptiveFormationEnvironment:
         for obstacle in self.static_obstacles:
             distance = np.linalg.norm(self.positions[agent_idx] - obstacle['position'])
             if distance < (self.agent_radius + obstacle['radius']):
-                return True
+                return True, 'static_obstacle'
 
         # 与动态障碍物碰撞检测
         for obstacle in self.dynamic_obstacles:
             distance = np.linalg.norm(self.positions[agent_idx] - obstacle['position'])
             if distance < (self.agent_radius + obstacle['radius']):
-                return True
+                return True, 'dynamic_obstacle'
 
         # 与其他智能体碰撞检测
         for i in range(self.n_agents):
             if i != agent_idx:
                 distance = np.linalg.norm(self.positions[agent_idx] - self.positions[i])
                 if distance < (2 * self.agent_radius):
-                    return True
+                    return True, 'agent_collision'
 
-        return False
+        return False, None
+
 
     def _check_target_reached(self, threshold=2.0):
         """检查是否所有智能体都达到目标区域"""
@@ -756,7 +769,8 @@ class ImprovedRewardCalculator:
             rewards[i] += formation_reward
 
             # 4. 碰撞惩罚
-            if self.env._check_collision(i):
+            has_collision, _ = self.env._check_collision(i)
+            if has_collision:
                 rewards[i] += self.reward_weights['collision']
 
             # 5. 到达目标的额外奖励
@@ -773,23 +787,6 @@ class ImprovedRewardCalculator:
 
         return rewards
 
-    def _compute_cooperation_reward(self):
-        """计算合作奖励 - 鼓励智能体保持合理距离"""
-        cooperation_score = 0
-        n_pairs = 0
-
-        for i in range(self.env.n_agents):
-            for j in range(i + 1, self.env.n_agents):
-                dist = np.linalg.norm(self.env.positions[i] - self.env.positions[j])
-                optimal_dist = 2.0  # 期望距离
-
-                # 距离在合理范围内给予奖励
-                if 1.5 <= dist <= 3.0:
-                    cooperation_score += 1.0 - abs(dist - optimal_dist) / optimal_dist
-
-                n_pairs += 1
-
-        return cooperation_score / max(n_pairs, 1) * self.reward_weights['cooperation']
 
     def _compute_efficiency_reward(self):
         """计算效率奖励 - 鼓励直接路径"""
