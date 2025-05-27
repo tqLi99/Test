@@ -168,7 +168,7 @@ class AdaptiveFormationEnvironment:
             {'position': np.array([5.0, 7.0]), 'radius': 1.2},
 
             # 右侧障碍物
-            {'position': np.array([15.0, 12.0]), 'radius': 1.3},
+            {'position': np.array([15.0, 7.5]), 'radius': 1.6},
 
             # 靠近目标的障碍物
             {'position': np.array([14.0, 16.0]), 'radius': 0.8},
@@ -491,16 +491,20 @@ class AdaptiveFormationEnvironment:
         self._update_dynamic_obstacles()
 
         # 调整队形
-        if self.current_step % 5 == 0:  # 每5步调整一次队形
+        if self.current_step % 5 == 0:
             self._adapt_formation()
 
         # 更新速度和位置
+        collision_occurred = False
+        collision_type = None
+        collision_agent = -1
+
         for i in range(self.n_agents):
             # 限制动作范围
             action = np.clip(actions[i], -1, 1)
 
             # 更新速度
-            self.velocities[i] += action * 0.1  # 降低加速度以平滑移动
+            self.velocities[i] += action * 0.1
 
             # 限制速度大小
             speed = np.linalg.norm(self.velocities[i])
@@ -508,22 +512,20 @@ class AdaptiveFormationEnvironment:
             if speed > max_speed:
                 self.velocities[i] = self.velocities[i] / speed * max_speed
 
-            # 临时存储当前位置，用于检测碰撞
-            old_position = self.positions[i].copy()
-
             # 更新位置
             self.positions[i] += self.velocities[i]
 
             # 确保在环境范围内
             self.positions[i] = np.clip(self.positions[i], 0, self.world_size)
 
-            # 检测碰撞
-            has_collision, collision_detail = self._check_collision(i)
-            if has_collision:
+            # 只检查与障碍物的碰撞来决定是否终止episode
+            # 智能体间碰撞通过奖励函数处理，不直接终止episode
+            has_obstacle_collision = self._check_obstacle_collision_only(i)
+            if has_obstacle_collision:
                 collision_occurred = True
-                collision_type = collision_detail
+                collision_type = 'obstacle'
                 collision_agent = i
-                break  # 发现碰撞立即停止
+                break
 
         # 计算奖励 - 使用改进的奖励计算器
         rewards = self.reward_calculator.compute_rewards()
@@ -531,23 +533,30 @@ class AdaptiveFormationEnvironment:
         # 检查是否到达目标
         reached_target = self._check_target_reached()
 
-        done = collision_occurred
-        # 判断是否结束 - 到达目标或超过最大步数
-        done = reached_target or self.current_step >= self.max_steps
+        # 判断是否结束 - 只有障碍物碰撞、到达目标或超过最大步数才终止
+        done = collision_occurred or reached_target or self.current_step >= self.max_steps
 
         # 获取观察
         observations = self._get_observations()
 
+        # 统计智能体间碰撞信息（用于监控，不影响episode终止）
+        agent_collisions = self._count_agent_collisions()
+
         info = {
             'reached_target': reached_target,
+            'obstacle_collision': collision_occurred,
+            'collision_type': collision_type,
+            'collision_agent': collision_agent,
+            'agent_collisions': agent_collisions,  # 智能体间碰撞数量
             'current_formation': self.current_formation,
             'step': self.current_step
         }
 
         return observations, rewards, done, info
 
-    def _check_collision(self, agent_idx):
-        """检查智能体是否与障碍物或其他智能体碰撞"""
+
+    def _check_obstacle_collision_only(self, agent_idx):
+        """只检查与障碍物的碰撞，不包括其他智能体"""
         # 与静态障碍物碰撞检测
         for obstacle in self.static_obstacles:
             distance = np.linalg.norm(self.positions[agent_idx] - obstacle['position'])
@@ -560,11 +569,48 @@ class AdaptiveFormationEnvironment:
             if distance < (self.agent_radius + obstacle['radius']):
                 return True
 
-        # 与其他智能体碰撞检测
+        return False
+
+    def _count_agent_collisions(self):
+        """统计当前时刻智能体间的碰撞数量"""
+        collision_count = 0
+        collision_distance = 2 * self.agent_radius
+
+        for i in range(self.n_agents):
+            for j in range(i + 1, self.n_agents):
+                distance = np.linalg.norm(self.positions[i] - self.positions[j])
+                if distance <= collision_distance:
+                    collision_count += 1
+
+        return collision_count
+
+    # 为了更好地监控智能体间碰撞，还可以添加这个辅助函数
+    def _get_detailed_agent_distances(self):
+        """获取所有智能体间的详细距离信息"""
+        distances = {}
+
+        for i in range(self.n_agents):
+            for j in range(i + 1, self.n_agents):
+                distance = np.linalg.norm(self.positions[i] - self.positions[j])
+                distances[f'agent_{i}_to_agent_{j}'] = distance
+
+        return distances
+
+    def _check_collision(self, agent_idx):
+        """
+        兼容性方法 - 检查指定智能体的所有类型碰撞
+        保持与原训练代码的兼容性
+        """
+        # 检查与障碍物的碰撞
+        if self._check_obstacle_collision_only(agent_idx):
+            return True
+
+        # 检查与其他智能体的碰撞
+        collision_distance = 2 * self.agent_radius
         for i in range(self.n_agents):
             if i != agent_idx:
                 distance = np.linalg.norm(self.positions[agent_idx] - self.positions[i])
-                if distance < (2 * self.agent_radius):
+                if distance <= collision_distance:
                     return True
 
         return False
@@ -709,24 +755,32 @@ class AdaptiveFormationEnvironment:
             return None
 
 
-# 改进的奖励计算器
+# 改进的奖励计算器 - 增强智能体间碰撞惩罚
 class ImprovedRewardCalculator:
     def __init__(self, env):
         self.env = env
         self.reward_weights = {
             'progress': 5.0,
             'formation': 0.2,
-            'collision': -3.0,
+            'collision': -3.0,  # 原有的障碍物碰撞惩罚
+            'agent_collision': -8.0,  # 新增：智能体间碰撞惩罚
+            'agent_near_collision': -2.0,  # 新增：智能体间接近惩罚
+            'agent_separation': 1.5,  # 新增：智能体间安全距离奖励
             'cooperation': 1.0,
             'efficiency': 0.5,
             'exploration': 0.1,
             'target_reach': 2.0,
-            'survival': 0.01,
+            'survival': -0.01,
             'success': 10.0
         }
 
+        # 智能体间安全距离参数
+        self.safe_distance = 2.5  # 安全距离
+        self.warning_distance = 1.8  # 警告距离
+        self.collision_distance = 2 * env.agent_radius  # 碰撞距离
+
     def compute_rewards(self):
-        """改进的奖励函数"""
+        """改进的奖励函数 - 重点加强智能体间碰撞惩罚"""
         rewards = np.zeros(self.env.n_agents)
 
         # 获取期望的编队位置
@@ -760,37 +814,100 @@ class ImprovedRewardCalculator:
             formation_reward = -self.reward_weights['formation'] * formation_error
             rewards[i] += formation_reward
 
-            # 4. 碰撞惩罚
-            if self.env._check_collision(i):
+            # 2. 原有的障碍物碰撞惩罚
+            has_obstacle_collision = self._check_obstacle_collision(i)
+            if has_obstacle_collision:
                 rewards[i] += self.reward_weights['collision']
 
-            # 5. 到达目标的额外奖励
+            # 3. 新增：智能体间碰撞和接近惩罚
+            agent_interaction_reward = self._compute_agent_interaction_reward(i)
+            rewards[i] += agent_interaction_reward
+
+            # 4. 到达目标的额外奖励
             agent_distance_to_target = np.linalg.norm(self.env.positions[i] - self.env.target_position)
             if agent_distance_to_target < 2.0:
                 rewards[i] += self.reward_weights['target_reach']
 
-            # 6. 存活奖励
+            # 5. 存活奖励
             rewards[i] += self.reward_weights['survival']
 
-            # 7. 完成任务的大额奖励
+            # 6. 完成任务的大额奖励
             if self.env._check_target_reached():
                 rewards[i] += self.reward_weights['success']
 
         return rewards
 
+    def _check_obstacle_collision(self, agent_idx):
+        """检查智能体是否与障碍物碰撞（不包括其他智能体）"""
+        # 与静态障碍物碰撞检测
+        for obstacle in self.env.static_obstacles:
+            distance = np.linalg.norm(self.env.positions[agent_idx] - obstacle['position'])
+            if distance < (self.env.agent_radius + obstacle['radius']):
+                return True
+
+        # 与动态障碍物碰撞检测
+        for obstacle in self.env.dynamic_obstacles:
+            distance = np.linalg.norm(self.env.positions[agent_idx] - obstacle['position'])
+            if distance < (self.env.agent_radius + obstacle['radius']):
+                return True
+
+        return False
+
+    def _compute_agent_interaction_reward(self, agent_idx):
+        """
+        计算智能体与其他智能体的交互奖励/惩罚
+        包括：碰撞惩罚、接近惩罚、安全距离奖励
+        """
+        total_reward = 0
+        agent_pos = self.env.positions[agent_idx]
+
+        for other_idx in range(self.env.n_agents):
+            if other_idx == agent_idx:
+                continue
+
+            other_pos = self.env.positions[other_idx]
+            distance = np.linalg.norm(agent_pos - other_pos)
+
+            # 1. 直接碰撞惩罚（最高优先级）
+            if distance <= self.collision_distance:
+                total_reward += self.reward_weights['agent_collision']
+                # 碰撞时额外的渐进惩罚，距离越近惩罚越重
+                collision_severity = max(0, (self.collision_distance - distance) / self.collision_distance)
+                total_reward += self.reward_weights['agent_collision'] * collision_severity
+
+            # 2. 接近惩罚（警告距离内）
+            elif distance <= self.warning_distance:
+                proximity_factor = (self.warning_distance - distance) / (
+                            self.warning_distance - self.collision_distance)
+                total_reward += self.reward_weights['agent_near_collision'] * proximity_factor
+
+            # 3. 安全距离奖励（在安全距离范围内）
+            elif distance <= self.safe_distance:
+                # 在安全距离内，给予奖励，但距离过远也不好（影响编队）
+                optimal_distance = (self.warning_distance + self.safe_distance) / 2
+                distance_from_optimal = abs(distance - optimal_distance)
+                safety_reward = max(0, 1 - distance_from_optimal / (self.safe_distance - optimal_distance))
+                total_reward += self.reward_weights['agent_separation'] * safety_reward
+
+        return total_reward
+
     def _compute_cooperation_reward(self):
-        """计算合作奖励 - 鼓励智能体保持合理距离"""
+        """计算合作奖励 - 鼓励智能体保持合理距离，修改以避免与碰撞惩罚重复"""
         cooperation_score = 0
         n_pairs = 0
 
         for i in range(self.env.n_agents):
             for j in range(i + 1, self.env.n_agents):
                 dist = np.linalg.norm(self.env.positions[i] - self.env.positions[j])
-                optimal_dist = 2.0  # 期望距离
 
-                # 距离在合理范围内给予奖励
-                if 1.5 <= dist <= 3.0:
-                    cooperation_score += 1.0 - abs(dist - optimal_dist) / optimal_dist
+                # 只在较大距离范围内计算合作奖励，避免与碰撞惩罚重叠
+                if dist > self.safe_distance:
+                    optimal_dist = 3.0  # 理想编队距离
+                    max_cooperation_dist = 5.0  # 最大合作距离
+
+                    if dist <= max_cooperation_dist:
+                        # 距离适中时给予合作奖励
+                        cooperation_score += 1.0 - abs(dist - optimal_dist) / optimal_dist
 
                 n_pairs += 1
 
@@ -1738,8 +1855,8 @@ if __name__ == "__main__":
         env = AdaptiveFormationEnvironment(
             n_agents=3,
             world_size=20,
-            n_static_obstacles=4,  # 使用4个静态障碍物（包括固定和随机）
-            n_dynamic_obstacles=1  # 使用1个动态障碍物
+            n_static_obstacles=7,  # 使用4个静态障碍物（包括固定和随机）
+            n_dynamic_obstacles=3  # 使用1个动态障碍物
         )
 
         print(f"环境创建成功: {env.n_agents}个智能体")
