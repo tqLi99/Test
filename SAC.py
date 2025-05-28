@@ -10,7 +10,6 @@ from matplotlib.animation import FuncAnimation
 from matplotlib.patches import Circle
 import math
 import random
-import os
 import sys
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
@@ -483,15 +482,18 @@ class AdaptiveFormationEnvironment:
         # 返回每个智能体观察到的状态
         return self._get_observations()
 
+    # 修复step方法中的碰撞处理
     def step(self, actions):
         """执行动作并返回新状态、奖励等"""
         self.current_step += 1
+        collision_occurred = False  # 初始化变量
+        collision_details = []
 
         # 更新动态障碍物
         self._update_dynamic_obstacles()
 
         # 调整队形
-        if self.current_step % 5 == 0:  # 每5步调整一次队形
+        if self.current_step % 5 == 0:
             self._adapt_formation()
 
         # 更新速度和位置
@@ -500,16 +502,13 @@ class AdaptiveFormationEnvironment:
             action = np.clip(actions[i], -1, 1)
 
             # 更新速度
-            self.velocities[i] += action * 0.1  # 降低加速度以平滑移动
+            self.velocities[i] += action * 0.1
 
             # 限制速度大小
             speed = np.linalg.norm(self.velocities[i])
             max_speed = 0.5
             if speed > max_speed:
                 self.velocities[i] = self.velocities[i] / speed * max_speed
-
-            # 临时存储当前位置，用于检测碰撞
-            old_position = self.positions[i].copy()
 
             # 更新位置
             self.positions[i] += self.velocities[i]
@@ -521,19 +520,19 @@ class AdaptiveFormationEnvironment:
             has_collision, collision_detail = self._check_collision(i)
             if has_collision:
                 collision_occurred = True
-                collision_type = collision_detail
-                collision_agent = i
-                break  # 发现碰撞立即停止
+                collision_details.append({
+                    'agent': i,
+                    'detail': collision_detail
+                })
 
-        # 计算奖励 - 使用改进的奖励计算器
+        # 计算奖励
         rewards = self.reward_calculator.compute_rewards()
 
         # 检查是否到达目标
         reached_target = self._check_target_reached()
 
-        done = collision_occurred
-        # 判断是否结束 - 到达目标或超过最大步数
-        done = reached_target or self.current_step >= self.max_steps
+        # 判断是否结束
+        done = collision_occurred or reached_target or self.current_step >= self.max_steps
 
         # 获取观察
         observations = self._get_observations()
@@ -541,33 +540,41 @@ class AdaptiveFormationEnvironment:
         info = {
             'reached_target': reached_target,
             'current_formation': self.current_formation,
-            'step': self.current_step
+            'step': self.current_step,
+            'collision_occurred': collision_occurred,
+            'collision_details': collision_details
         }
 
         return observations, rewards, done, info
 
+    # 修复碰撞检测方法
     def _check_collision(self, agent_idx):
         """检查智能体是否与障碍物或其他智能体碰撞"""
+        collision_info = {'type': None, 'with': None}
+
         # 与静态障碍物碰撞检测
-        for obstacle in self.static_obstacles:
+        for idx, obstacle in enumerate(self.static_obstacles):
             distance = np.linalg.norm(self.positions[agent_idx] - obstacle['position'])
             if distance < (self.agent_radius + obstacle['radius']):
-                return True
+                collision_info = {'type': 'static_obstacle', 'with': idx}
+                return True, collision_info
 
         # 与动态障碍物碰撞检测
-        for obstacle in self.dynamic_obstacles:
+        for idx, obstacle in enumerate(self.dynamic_obstacles):
             distance = np.linalg.norm(self.positions[agent_idx] - obstacle['position'])
             if distance < (self.agent_radius + obstacle['radius']):
-                return True
+                collision_info = {'type': 'dynamic_obstacle', 'with': idx}
+                return True, collision_info
 
         # 与其他智能体碰撞检测
         for i in range(self.n_agents):
             if i != agent_idx:
                 distance = np.linalg.norm(self.positions[agent_idx] - self.positions[i])
                 if distance < (2 * self.agent_radius):
-                    return True
+                    collision_info = {'type': 'agent', 'with': i}
+                    return True, collision_info
 
-        return False
+        return False, collision_info
 
     def _check_target_reached(self, threshold=2.0):
         """检查是否所有智能体都达到目标区域"""
@@ -716,12 +723,12 @@ class ImprovedRewardCalculator:
         self.reward_weights = {
             'progress': 5.0,
             'formation': 0.2,
-            'collision': -3.0,
+            'collision': -10.0,
             'cooperation': 1.0,
             'efficiency': 0.5,
             'exploration': 0.1,
             'target_reach': 2.0,
-            'survival': 0.01,
+            'survival': -0.01,
             'success': 10.0
         }
 
@@ -1332,7 +1339,8 @@ def train_optimized_masac(env_class, n_episodes=2000, max_steps=200, batch_size=
         writer.add_scalar('Rewards/Episode_Reward', episode_reward, episode)
         writer.add_scalar('Success/Success_Rate', current_success, episode)
         writer.add_scalar('Errors/Formation_Error', formation_error, episode)
-        writer.add_scalar('Errors/Collision_Count', collisions, episode)
+        alpha_val = agents[i].alpha if isinstance(agents[i].alpha, (int, float)) else agents[i].alpha.item()
+        writer.add_scalar(f'Agent_{i}/Alpha', alpha_val, episode)
         writer.add_scalar('Training/Steps_Per_Episode', step + 1, episode)
 
         # 记录每个智能体的损失
@@ -1340,7 +1348,8 @@ def train_optimized_masac(env_class, n_episodes=2000, max_steps=200, batch_size=
             writer.add_scalar(f'Agent_{i}/Critic_Loss', avg_critic_losses[i], episode)
             writer.add_scalar(f'Agent_{i}/Actor_Loss', avg_actor_losses[i], episode)
             writer.add_scalar(f'Agent_{i}/Reward', rewards[i], episode)
-            writer.add_scalar(f'Agent_{i}/Alpha', agents[i].alpha.detach().item(), episode)
+            alpha_value = agents[i].alpha.item() if hasattr(agents[i].alpha, 'item') else agents[i].alpha
+            writer.add_scalar(f'Agent_{i}/Alpha', alpha_value, episode)
 
             # 记录当前队形
         writer.add_text('Formation', info.get('current_formation', 'unknown'), episode)
@@ -1376,7 +1385,8 @@ def train_optimized_masac(env_class, n_episodes=2000, max_steps=200, batch_size=
             print(f"  步数: {step + 1}/{max_steps}")
             print(f"  平均Critic损失: {np.mean(avg_critic_losses):.4f}")
             print(f"  平均Actor损失: {np.mean(avg_actor_losses):.4f}")
-            print(f"  熵权重: {agents[0].alpha.detach().item():.4f}")
+            alpha_value = agents[0].alpha.item() if hasattr(agents[0].alpha, 'item') else agents[0].alpha
+            print(f"  熵权重: {alpha_value:.4f}")
             print(f"  缓冲区大小: {len(memory)}")
             print()
 
