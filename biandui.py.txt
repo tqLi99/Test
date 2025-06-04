@@ -161,16 +161,15 @@ class AdaptiveFormationEnvironment:
         # 固定障碍物的位置和大小
         fixed_obstacles = [
             # 中间的大障碍物
-            {'position': np.array([10.0, 10.0]), 'radius': 2.0},
+            {'position': np.array([7.5, 12.5]), 'radius': 2.0},
 
             # 左侧障碍物
             {'position': np.array([5.0, 7.0]), 'radius': 1.2},
 
             # 右侧障碍物
-            {'position': np.array([15.0, 12.0]), 'radius': 1.3},
+            {'position': np.array([12.5, 7.5]), 'radius': 1.5},
 
-            # 靠近目标的障碍物
-            {'position': np.array([14.0, 16.0]), 'radius': 0.8},
+
         ]
 
         # 确定固定障碍物的数量 - 保证不超过要求的总数
@@ -575,7 +574,7 @@ class AdaptiveFormationEnvironment:
 
         return False, None
 
-    def _check_target_reached(self, threshold=2.0):
+    def _check_target_reached(self, threshold=3.0):
         """检查是否所有智能体都达到目标区域"""
         # 计算每个智能体到目标的距离
         distances = [np.linalg.norm(self.positions[i] - self.target_position) for i in range(self.n_agents)]
@@ -720,13 +719,13 @@ class ImprovedRewardCalculator:
     def __init__(self, env):
         self.env = env
         self.reward_weights = {
-            'progress': 5.0,
+            'progress': 6.0,
             'formation': 0.2,
             'collision': -3.0,
             'cooperation': 1.0,
             'efficiency': 0.5,
             'exploration': 0.1,
-            'target_reach': 2.0,
+            'target_reach': 3.0,
             'survival': -0.01,
             'success': 10.0
         }
@@ -1019,11 +1018,16 @@ class OptimizedMASACAgent:
         for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
             target_param.data.copy_(param.data)
 
-        # 自动调整熵
+            # 熵权重处理 - 修复点
         if self.auto_entropy_tuning:
             self.target_entropy = -torch.prod(torch.Tensor([action_dim]).to(device)).item()
             self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
             self.alpha_optimizer = optim.AdamW([self.log_alpha], lr=lr)
+            # 确保 alpha 是张量
+            self.alpha = self.log_alpha.exp()
+        else:
+            # 对于固定熵权重，也使用张量以保持一致性
+            self.alpha = torch.tensor(alpha, device=device, requires_grad=False)
 
         # 梯度裁剪
         self.max_grad_norm = 0.5
@@ -1184,7 +1188,7 @@ class OptimizedMASACAgent:
 
 
 # 优化的训练函数
-def train_optimized_masac(env_class, n_episodes=2000, max_steps=200, batch_size=128, buffer_size=int(2e6),
+def train_optimized_masac(env_class, n_episodes=2000, max_steps=200, batch_size=512, buffer_size=int(1e6),
                           print_every=10, render_every=100, save_every=200, comment='', num_parallel_envs=1,
                           use_prioritized_replay=True, **env_kwargs):
     """优化的MASAC训练函数"""
@@ -1749,8 +1753,8 @@ if __name__ == "__main__":
         env = AdaptiveFormationEnvironment(
             n_agents=3,
             world_size=20,
-            n_static_obstacles=4,  # 使用4个静态障碍物（包括固定和随机）
-            n_dynamic_obstacles=1  # 使用1个动态障碍物
+            n_static_obstacles=5,  # 使用4个静态障碍物（包括固定和随机）
+            n_dynamic_obstacles=2  # 使用1个动态障碍物
         )
 
         print(f"环境创建成功: {env.n_agents}个智能体")
@@ -1762,12 +1766,12 @@ if __name__ == "__main__":
             env_class=AdaptiveFormationEnvironment,
             n_agents=3,
             world_size=20,
-            n_static_obstacles=4,
-            n_dynamic_obstacles=1,
-            n_episodes=3000,  # 适中的训练回合数
+            n_static_obstacles=5,
+            n_dynamic_obstacles=2,
+            n_episodes=80000,  # 适中的训练回合数
             max_steps=200,
-            batch_size=128,  # 适中的批次大小以节省内存
-            buffer_size=int(5e5),  # 减少缓冲区大小以节省内存
+            batch_size=512,  # 适中的批次大小以节省内存
+            buffer_size=int(3e5),  # 减少缓冲区大小以节省内存
             print_every=50,
             render_every=500,  # 减少渲染频率以节省时间
             save_every=500,
@@ -1835,4 +1839,3 @@ if __name__ == "__main__":
         except Exception as debug_e:
             print(f"❌ 调试模式也失败: {debug_e}")
             traceback.print_exc()
-
