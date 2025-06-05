@@ -1,0 +1,25 @@
+environment:
+  agent_radius: 0.5
+  max_steps: 200
+  n_agents: 3
+  n_dynamic_obstacles: 2
+  n_static_obstacles: 5
+  obstacle_radius: 1.0
+  world_size: 20
+parallel:
+  max_workers: 4
+  n_envs: 4
+  use_parallel: true
+training:
+  alpha: 0.2
+  auto_entropy_tuning: true
+  batch_size: 512
+  buffer_size: 300000
+  gamma: 0.99
+  hidden_dim: 256
+  learning_rate: 0.0003
+  max_grad_norm: 0.5
+  n_episodes: 20000
+  tau: 0.005
+  update_freq: 4
+  use_prioritized_replay: true
